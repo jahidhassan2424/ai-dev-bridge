@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "AI Development Bridge",
+  "version": "1.0.0",
+  "description": "Sends test messages to the local AI Development Bridge server.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2rhbfZ/A8CW2ed7o8yZDWZeH5wyEHdLzovN43tKxI57Obqi8u1pmZpS+obKr900zD6IRxc1kZt26lnb3lMb7t9kYQ5fSkc1/BGGGjtKlm0KeFgS+CMIKVENE4+KXmFIFaj+L9Xy9UYMy+/qyV9CM7p7AJo6cGqQHusWtzoxkreNQyeNvtDIYQ5tjLLaC/UUsT6rT+1xsrqurrQ3sIHgRrtyF0/CmlDD4jrDuhVKZEOQfUeDxwHJNeMz3+3TzuPUp7kmCHeipa+bwagF9RMyBIb0Rcau/i+LepvGL2kCchPxbUhclGmH4AOEqaVv5ThbOMyC0GdGXXuWA+BHav7B4SQIDAQAB",
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "AI Development Bridge"
+  },
+  "permissions": ["storage"],
+  "host_permissions": ["http://127.0.0.1:3000/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*"],
+      "js": ["capture-logic.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

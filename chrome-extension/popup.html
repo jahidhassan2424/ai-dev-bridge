@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI Dev Bridge</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="popup-shell">
+      <header class="app-header">
+        <div>
+          <p class="eyebrow">LOCAL DEVELOPER TOOL</p>
+          <h1>AI Dev Bridge</h1>
+          <p class="subtitle">ChatGPT response capture for your local workflow.</p>
+        </div>
+        <span class="version" aria-label="Version 1.0.0">v1.0.0</span>
+      </header>
+
+      <section class="card capture-card" aria-labelledby="capture-heading">
+        <div class="section-heading">
+          <div>
+            <h2 id="capture-heading">Response capture</h2>
+            <p id="capture-status" class="status-copy" role="status">Capture is disabled.</p>
+          </div>
+          <label class="switch-control">
+            <input id="capture-enabled" type="checkbox" role="switch" aria-describedby="capture-status" />
+            <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
+            <span class="visually-hidden">Enable response capture</span>
+          </label>
+        </div>
+      </section>
+
+      <section class="card response-card" aria-labelledby="latest-response-heading">
+        <div class="section-heading response-heading">
+          <div>
+            <h2 id="latest-response-heading">Latest response</h2>
+            <p id="capture-metadata" class="metadata">No response captured yet.</p>
+          </div>
+          <span class="response-badge">LOCAL</span>
+        </div>
+        <div id="captured-response" class="response-preview" tabindex="0" aria-live="polite">
+          <p class="empty-state">Captured ChatGPT responses will appear here.</p>
+        </div>
+      </section>
+
+      <section class="card bridge-card" aria-labelledby="bridge-heading">
+        <div class="section-heading">
+          <div>
+            <h2 id="bridge-heading">Local bridge</h2>
+            <p id="bridge-status" class="bridge-status" data-state="checking" role="status">
+              <span class="status-dot" aria-hidden="true"></span>
+              <span id="bridge-status-text">Checking connection...</span>
+            </p>
+          </div>
+        </div>
+        <div class="button-row">
+          <button id="check-connection" class="button button-secondary" type="button">Test Connection</button>
+          <button id="send-test" class="button button-primary" type="button">Send Test</button>
+        </div>
+        <p id="bridge-feedback" class="feedback" data-state="idle" role="status" aria-live="polite">&nbsp;</p>
+      </section>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
