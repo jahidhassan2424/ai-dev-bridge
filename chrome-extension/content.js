@@ -1,10 +1,10 @@
-const assistantSelector = '[data-message-author-role="assistant"]';
+const assistantSelector = '[conversation-role="assistant"]';
 const generationControlSelectors = [
   'button[aria-label*="Stop" i]',
   '[data-testid*="stop" i]',
 ];
 const completionQuietPeriodMs = 1_800;
-const { isCompletionSafe } = globalThis.AiDevBridgeCaptureLogic;
+const { extractAssistantText, isCompletionSafe } = globalThis.AiDevBridgeCaptureLogic;
 
 const knownAssistantMessages = new WeakSet();
 const knownMessageTexts = new WeakMap();
@@ -39,11 +39,11 @@ function rememberCurrentMessages() {
 }
 
 function getMessageKey(message) {
-  return message.getAttribute("data-message-id") || getMessageText(message);
+  return message.getAttribute("data-dil-message-id") || message.getAttribute("data-message-id") || getMessageText(message);
 }
 
 function getMessageText(message) {
-  return (message.innerText || message.textContent || "").trim();
+  return extractAssistantText(message);
 }
 
 function scheduleCompletionCheck(message) {

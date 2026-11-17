@@ -5,7 +5,32 @@ const vm = require("node:vm");
 
 const context = {};
 vm.runInNewContext(fs.readFileSync("chrome-extension/capture-logic.js", "utf8"), context);
-const { isCompletionSafe } = context.AiDevBridgeCaptureLogic;
+const { extractAssistantText, isCompletionSafe } = context.AiDevBridgeCaptureLogic;
+
+test("extracts verified assistant markup without toolbar controls", () => {
+  const markdownNode = {
+    innerText: "Readable answer Copy",
+    textContent: "Readable answer Copy",
+    cloneNode() {
+      return {
+        innerText: "Readable answer",
+        textContent: "Readable answer",
+        querySelectorAll(selector) {
+          assert.match(selector, /button/);
+          return [];
+        },
+      };
+    },
+  };
+  const message = {
+    querySelectorAll(selector) {
+      assert.equal(selector, '[data-markdown-text-style="assistant-message"]');
+      return [markdownNode];
+    },
+  };
+
+  assert.equal(extractAssistantText(message), "Readable answer");
+});
 
 function state(overrides = {}) {
   return {
