@@ -5,7 +5,7 @@ const vm = require("node:vm");
 
 const context = {};
 vm.runInNewContext(fs.readFileSync("chrome-extension/capture-logic.js", "utf8"), context);
-const { extractAssistantText, getResponseKey, isCompletionSafe, completionDelay, normalizeComposerText, hasComposerDraft, hasTerminalStopMarker, isComposerReady } = context.AiDevBridgeCaptureLogic;
+const { extractAssistantText, getResponseKey, isCompletionSafe, completionDelay, normalizeComposerText, hasComposerDraft, hasTerminalStopMarker, hasSkipMarker, isComposerReady } = context.AiDevBridgeCaptureLogic;
 
 function textNode(value) { return { nodeType: 3, nodeValue: value, textContent: value }; }
 function element(tagName, children = []) {
@@ -24,6 +24,17 @@ test("terminal stop marker is only accepted as a standalone non-quoted, non-code
   assert.equal(hasTerminalStopMarker("Please write AI_BRIDGE_STOP later"), false);
   assert.equal(hasTerminalStopMarker("> AI_BRIDGE_STOP"), false);
   assert.equal(hasTerminalStopMarker("```text\nAI_BRIDGE_STOP\n```"), false);
+});
+
+test("skip marker is standalone, protects quoted and code examples, and STOP has priority", () => {
+  assert.equal(hasSkipMarker("Continue\nAI_BRIDGE_SKIP\n"), true);
+  assert.equal(hasSkipMarker("Please emit AI_BRIDGE_SKIP next"), false);
+  assert.equal(hasSkipMarker("`AI_BRIDGE_SKIP`"), false);
+  assert.equal(hasSkipMarker("> AI_BRIDGE_SKIP"), false);
+  assert.equal(hasSkipMarker("```text\nAI_BRIDGE_SKIP\n```"), false);
+  const both = "AI_BRIDGE_SKIP\nAI_BRIDGE_STOP";
+  assert.equal(hasTerminalStopMarker(both), true);
+  assert.equal(hasSkipMarker(both), true);
 });
 
 test("DOM extraction preserves a formatted standalone terminal marker", () => {
@@ -186,6 +197,14 @@ test("Codex delivery confirms a new matching user message, not an empty composer
   assert.match(contentScript, /userMessageBaseline/);
   assert.match(contentScript, /!baseline\.elements\.has\(element\)/);
   assert.doesNotMatch(contentScript, /const cleared = await waitForComposerClear/);
+});
+
+test("delivery recovery rejects pre-existing identical messages and requires a baseline", () => {
+  const contentScript = fs.readFileSync("chrome-extension/content.js", "utf8");
+  assert.match(contentScript, /exactVisibleUserMessageMatches\(text, baselineKeys/);
+  assert.match(contentScript, /!baseline\.has\(userMessageKey\(element\)\)/);
+  assert.match(contentScript, /requiresManualConfirmation/);
+  assert.match(contentScript, /outcome: "legacy"/);
 });
 
 test("Codex delivery emits metadata-only lifecycle diagnostics", () => {

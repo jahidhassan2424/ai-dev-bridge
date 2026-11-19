@@ -10,8 +10,15 @@ const autoForwardEnabled = document.querySelector("#auto-forward-enabled");
 const forwardingStatus = document.querySelector("#forwarding-status");
 const autoSubmitEnabled = document.querySelector("#auto-submit-enabled");
 const autoSubmitStatus = document.querySelector("#auto-submit-status");
+const deliveryRecoveryActions = document.querySelector("#delivery-recovery-actions");
+const checkDeliveryButton = document.querySelector("#check-delivery");
+const abandonDeliveryButton = document.querySelector("#abandon-delivery");
+const deliveryRecoveryDetail = document.querySelector("#delivery-recovery-detail");
 const automationStatus = document.querySelector("#automation-status");
 const automationWorkspace = document.querySelector("#automation-workspace");
+const approveWorkspaceButton = document.querySelector("#approve-workspace");
+const revokeWorkspaceButton = document.querySelector("#revoke-workspace");
+const workspaceApprovalStatus = document.querySelector("#workspace-approval-status");
 const conversationUrlInput = document.querySelector("#conversation-url");
 const useCurrentTabButton = document.querySelector("#use-current-tab");
 const enableAutomationButton = document.querySelector("#enable-automation");
@@ -42,8 +49,10 @@ if (
   !autoForwardEnabled ||
   !autoSubmitEnabled ||
   !autoSubmitStatus ||
+  !deliveryRecoveryActions || !checkDeliveryButton || !abandonDeliveryButton || !deliveryRecoveryDetail ||
   !automationStatus ||
   !automationWorkspace ||
+  !approveWorkspaceButton || !revokeWorkspaceButton || !workspaceApprovalStatus ||
   !conversationUrlInput ||
   !useCurrentTabButton ||
   !enableAutomationButton ||
@@ -106,19 +115,76 @@ let latestCodexResponse = "";
 let codexPairingToken = "";
 
 function displayAutoSubmitStatus(state, enabled) {
+  const uncertain = state?.status === "uncertain";
+  const verifying = state?.status === "verifying" || state?.stage === "recovery-verifying";
+  deliveryRecoveryActions.hidden = !(enabled && uncertain);
+  deliveryRecoveryDetail.textContent = uncertain ? "Check performs verification only. It never resends the report." : verifying ? "Verifying the selected conversation read-only; no report will be resent." : "";
+  deliveryRecoveryDetail.dataset.state = uncertain || verifying ? "pending" : "";
   if (!enabled) {
     autoSubmitStatus.textContent = "Disabled. Reports require Automation Mode and pairing.";
     autoSubmitStatus.dataset.state = "idle";
     return;
   }
-  const labels = { ready: "A completed Codex report is ready for automatic delivery.", submitting: "Submitting a completed Codex report...", submitted: "Latest completed report confirmed in ChatGPT.", error: "Automatic report delivery failed; manual review is required." };
-  const uncertain = state?.status === "uncertain"
+  const labels = { ready: "A completed Codex report is ready for automatic delivery.", submitting: "Sending a completed Codex report...", verifying: "Verifying delivery evidence...", submitted: "Delivered: the report is confirmed in ChatGPT.", abandoned: "Abandoned: the uncertain report will not be resent.", error: "Automatic report delivery failed; manual review is required." };
+  const uncertainMessage = state?.status === "uncertain"
     ? state.attempted === true
       ? "Report submission was attempted but not confirmed; manual review is required."
       : "Report was not submitted; manual review is required."
     : undefined;
-  autoSubmitStatus.textContent = uncertain || labels[state?.status] || "Enabled. Waiting for a completed Codex report.";
-  autoSubmitStatus.dataset.state = state?.status === "uncertain" || state?.status === "error" ? "error" : state?.status === "submitted" ? "success" : "pending";
+  autoSubmitStatus.textContent = uncertainMessage || labels[state?.status] || "Enabled. Waiting for a completed Codex report.";
+  autoSubmitStatus.dataset.state = state?.status === "uncertain" || state?.status === "error" ? "error" : state?.status === "submitted" || state?.status === "abandoned" ? "success" : "pending";
+}
+
+async function selectedConversationTab() {
+  const selected = globalThis.AiDevBridgeConversation.normalizeConversationUrl(conversationUrlInput.value.trim());
+  if (!selected) throw new Error("Enter a valid selected ChatGPT conversation URL first.");
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const current = globalThis.AiDevBridgeConversation.normalizeConversationUrl(tab?.url || "");
+  if (!tab?.id || !current || current.path !== selected.path) throw new Error("Open the exact selected ChatGPT conversation before checking delivery.");
+  return { tab, selected };
+}
+
+async function recoverDelivery() {
+  checkDeliveryButton.disabled = true; abandonDeliveryButton.disabled = true;
+  try {
+    const state = await chrome.storage.local.get(["codexDeliveryStatus"]);
+    const delivery = state.codexDeliveryStatus;
+    if (delivery?.status !== "uncertain" || !delivery?.submissionId) throw new Error("There is no uncertain delivery to check.");
+    const { tab, selected } = await selectedConversationTab();
+    const result = await chrome.tabs.sendMessage(tab.id, { type: "recoverCodexDelivery", conversationUrl: selected.url, submissionId: delivery.submissionId });
+    if (result?.success && result.status === "submitted") {
+      deliveryRecoveryDetail.textContent = "Confirmed: one matching user message exists in the selected conversation. No resend was performed.";
+      deliveryRecoveryDetail.dataset.state = "success";
+    } else if (result?.outcome === "legacy" && window.confirm("This delivery has no reliable pre-send message baseline. Confirm manually that the report was delivered? No resend will occur.")) {
+      const confirmed = await chrome.runtime.sendMessage({ type: "confirmAmbiguousCodexDelivery", conversationUrl: selected.url, submissionId: delivery.submissionId });
+      if (!confirmed?.success) throw new Error(confirmed?.error || "The ambiguous delivery was not confirmed.");
+      if (confirmed.resumeAllowed) await chrome.tabs.sendMessage(tab.id, { type: "resumeCodexResultWatch", conversationUrl: selected.url });
+      deliveryRecoveryDetail.textContent = "Delivery manually confirmed from ambiguous matches. No resend was performed.";
+      deliveryRecoveryDetail.dataset.state = "success";
+    } else {
+      deliveryRecoveryDetail.textContent = result?.error || "The report could not be confirmed. It remains uncertain and was not resent.";
+      deliveryRecoveryDetail.dataset.state = "error";
+    }
+    await refreshAutoSubmitDeliveryStatus();
+  } catch (error) { deliveryRecoveryDetail.textContent = error instanceof Error ? error.message : "Delivery recovery failed."; deliveryRecoveryDetail.dataset.state = "error"; }
+  finally { checkDeliveryButton.disabled = false; abandonDeliveryButton.disabled = false; }
+}
+
+async function abandonDelivery() {
+  const state = await chrome.storage.local.get(["codexDeliveryStatus"]);
+  const delivery = state.codexDeliveryStatus;
+  if (delivery?.status !== "uncertain" || !delivery?.submissionId) { deliveryRecoveryDetail.textContent = "There is no uncertain delivery to abandon."; return; }
+  if (!window.confirm("Abandon this uncertain delivery? This preserves its record and prevents automatic resend. It does not delete or resend anything.")) return;
+  checkDeliveryButton.disabled = true; abandonDeliveryButton.disabled = true;
+  try {
+    const selected = globalThis.AiDevBridgeConversation.normalizeConversationUrl(conversationUrlInput.value.trim());
+    if (!selected) throw new Error("Enter a valid selected ChatGPT conversation URL first.");
+    const result = await chrome.runtime.sendMessage({ type: "abandonCodexDelivery", conversationUrl: selected.url, submissionId: delivery.submissionId });
+    if (!result?.success) throw new Error(result?.error || "The bridge did not abandon the uncertain delivery.");
+    deliveryRecoveryDetail.textContent = "Delivery abandoned. The report was not resent."; deliveryRecoveryDetail.dataset.state = "success";
+    await refreshAutoSubmitDeliveryStatus();
+  } catch (error) { deliveryRecoveryDetail.textContent = error instanceof Error ? error.message : "Unable to abandon delivery."; deliveryRecoveryDetail.dataset.state = "error"; }
+  finally { checkDeliveryButton.disabled = false; abandonDeliveryButton.disabled = false; }
 }
 
 async function refreshAutoSubmitDeliveryStatus() {
@@ -179,6 +245,25 @@ async function refreshAutomationState() {
   displayAutomationState(body.state);
 }
 
+async function updateWorkspaceApproval(method) {
+  const workspace = automationWorkspace.value.trim();
+  if (!codexPairingToken) throw new Error("Pair Chrome with the local bridge first.");
+  if (!workspace) throw new Error("Enter an existing absolute workspace path.");
+  const approving = method === "POST";
+  if (approving && !window.confirm(`Approve this canonical workspace for AI Dev Bridge?\n\n${workspace}`)) return;
+  if (!approving && !window.confirm(`Revoke persistent AI Dev Bridge approval for this workspace?\n\n${workspace}`)) return;
+  approveWorkspaceButton.disabled = true; revokeWorkspaceButton.disabled = true;
+  try {
+    const response = await fetch(`${bridgeUrl}/api/codex/workspaces`, { method, headers: { "Content-Type": "application/json", Authorization: `Bearer ${codexPairingToken}` }, body: JSON.stringify({ workspace, ...(approving ? { confirm: true } : {}) }) });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || body.success !== true) throw new Error(body.error || `Bridge returned ${response.status}`);
+    if (body.workspace) automationWorkspace.value = body.workspace;
+    workspaceApprovalStatus.textContent = approving ? "Workspace approved locally." : "Workspace approval revoked.";
+    workspaceApprovalStatus.dataset.state = "success";
+  } catch (error) { workspaceApprovalStatus.textContent = error instanceof Error ? error.message : "Workspace approval failed."; workspaceApprovalStatus.dataset.state = "error"; }
+  finally { approveWorkspaceButton.disabled = false; revokeWorkspaceButton.disabled = false; }
+}
+
 function setBridgeStatus(state, message) {
   bridgeStatus.dataset.state = state;
   bridgeStatusText.textContent = message;
@@ -202,7 +287,7 @@ function displayCapture(capture) {
 
   const capturedAt = new Date(capture.capturedAt);
   const timestamp = Number.isNaN(capturedAt.getTime()) ? "Unknown time" : capturedAt.toLocaleString();
-  captureMetadata.textContent = `${timestamp} - ${capture.text.length} characters`;
+  captureMetadata.textContent = `${timestamp} - ${capture.text.length} characters${capture.status === "skipped" ? " - Skipped" : ""}`;
   capturedResponse.textContent = capture.text;
 }
 
@@ -401,6 +486,11 @@ autoSubmitEnabled.addEventListener("change", async () => {
     autoSubmitEnabled.disabled = false;
   }
 });
+
+checkDeliveryButton.addEventListener("click", () => { void recoverDelivery(); });
+abandonDeliveryButton.addEventListener("click", () => { void abandonDelivery(); });
+approveWorkspaceButton.addEventListener("click", () => { void updateWorkspaceApproval("POST"); });
+revokeWorkspaceButton.addEventListener("click", () => { void updateWorkspaceApproval("DELETE"); });
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName !== "local") {

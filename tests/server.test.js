@@ -3,7 +3,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
-const { createCaptureStore, createServer, resolveVscodeTokenFile, validateCapturePayload } = require("../dist/server.js");
+const { createCaptureStore, createServer, resolveVscodeTokenFile, validateCapturePayload, readApprovedWorkspaces, writeApprovedWorkspaces } = require("../dist/server.js");
 
 const origin = "chrome-extension://flpkdgbjocacgdlnfhinaeicigegfklb";
 const capture = {
@@ -16,6 +16,19 @@ const capture = {
 test("server token paths resolve from the bridge project regardless of launch directory", () => {
   assert.match(resolveVscodeTokenFile(".local/ai-dev-bridge-vscode.token"), /ai-dev-bridge[\\/]\.local[\\/]ai-dev-bridge-vscode\.token$/);
   assert.equal(resolveVscodeTokenFile("C:\\tokens\\bridge.token"), "C:\\tokens\\bridge.token");
+});
+
+test("approved workspace paths persist canonically and discard missing entries", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-dev-bridge-workspaces-"));
+  const approved = path.join(directory, "approved");
+  const stateFile = path.join(directory, "workspaces.json");
+  fs.mkdirSync(approved);
+  try {
+    writeApprovedWorkspaces([fs.realpathSync(approved)], stateFile);
+    assert.deepEqual(readApprovedWorkspaces(stateFile), [fs.realpathSync(approved)]);
+    fs.rmSync(approved, { recursive: true, force: true });
+    assert.deepEqual(readApprovedWorkspaces(stateFile), []);
+  } finally { fs.rmSync(directory, { recursive: true, force: true }); }
 });
 
 test("authenticated context import targets the selected workspace session", async () => {
@@ -139,6 +152,13 @@ test("capture endpoints require the extension origin and acknowledge duplicates"
     });
     assert.deepEqual(await duplicate.json(), { success: true, duplicate: true, automation: { decision: "skipped", reason: "duplicate" } });
 
+    const skipped = await fetch(`${url}/api/captures`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: origin },
+      body: JSON.stringify({ ...capture, id: "skipped-response", text: "No Codex task\nAI_BRIDGE_SKIP", status: "skipped" }),
+    });
+    assert.deepEqual(await skipped.json(), { success: true, duplicate: false, automation: { decision: "skipped", reason: "skipped_marker" } });
+
     const invalid = await fetch(`${url}/api/captures`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Origin: origin },
@@ -148,12 +168,15 @@ test("capture endpoints require the extension origin and acknowledge duplicates"
     assert.deepEqual(await invalid.json(), { success: false, error: "Invalid capture payload" });
 
     const latest = await fetch(`${url}/api/captures/latest`, { headers: { Origin: origin } });
-    assert.deepEqual((await latest.json()).captures, [capture]);
+    assert.deepEqual((await latest.json()).captures, [
+      { ...capture, id: "skipped-response", text: "No Codex task\nAI_BRIDGE_SKIP", status: "skipped" },
+      capture,
+    ]);
 
     const status = await fetch(`${url}/api/captures/status`, { headers: { Origin: origin } });
     assert.deepEqual(await status.json(), {
-      count: 1,
-      latestId: capture.id,
+      count: 2,
+      latestId: "skipped-response",
       latestTimestamp: capture.timestamp,
     });
 
@@ -598,7 +621,7 @@ test("manual and automatic Stop share the authoritative transition", async () =>
   }
 });
 
-test("three completed exchanges followed by Stop produce no later Codex submission", async () => {
+test("five completed exchanges followed by Stop produce no later Codex submission", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-dev-bridge-three-round-stop-"));
   const chromeTokenFile = path.join(directory, "chrome.token");
   const chromeToken = "c".repeat(64);
@@ -610,10 +633,10 @@ test("three completed exchanges followed by Stop produce no later Codex submissi
   const url = `http://127.0.0.1:${server.address().port}`;
   const vscodeHeaders = { Authorization: "Bearer test-vscode-token", "Content-Type": "application/json" };
   const chromeHeaders = { Authorization: `Bearer ${chromeToken}`, "Content-Type": "application/json", Origin: origin };
-  const conversationUrl = "https://chatgpt.com/c/three-round-stop";
+  const conversationUrl = "https://chatgpt.com/c/five-round-stop";
   try {
     await fetch(`${url}/api/vscode/codex/automation`, { method: "POST", headers: vscodeHeaders, body: JSON.stringify({ enabled: true, workspace: process.cwd(), conversationUrl, sandboxMode: "read-only" }) });
-    for (let round = 1; round <= 3; round += 1) {
+    for (let round = 1; round <= 5; round += 1) {
       const queued = await fetch(`${url}/api/captures`, { method: "POST", headers: { "Content-Type": "application/json", Origin: origin }, body: JSON.stringify({ ...capture, id: `round-${round}`, text: `ROUND_${round}`, conversationUrl }) });
       assert.equal(typeof (await queued.json()).submissionId, "string");
       for (let attempt = 0; attempt < 20 && prompts < round; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
@@ -622,7 +645,7 @@ test("three completed exchanges followed by Stop produce no later Codex submissi
     assert.equal((await stopped.json()).state.stoppedReason, "task-completed");
     const acknowledgment = await fetch(`${url}/api/captures`, { method: "POST", headers: { "Content-Type": "application/json", Origin: origin }, body: JSON.stringify({ ...capture, id: "post-stop-ack", text: "Understood.", conversationUrl }) });
     assert.equal((await acknowledgment.json()).automation.reason, "stopped");
-    assert.equal(prompts, 3);
+    assert.equal(prompts, 5);
   } finally {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     fs.rmSync(directory, { recursive: true, force: true });

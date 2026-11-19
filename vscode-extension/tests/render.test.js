@@ -122,3 +122,16 @@ test("renders explicit conflict recovery beside blocked captures and history", (
   assert.match(html, /data-action="retryAfterConflict"/);
   assert.doesNotMatch(html, /Retry Failed/);
 });
+
+test("renders delivery verification states separately from Codex execution", () => {
+  const submissions = [
+    { id: "verifying-1", captureId: "capture-1", workspace: "C:/trusted/project", sandboxMode: "read-only", status: "completed", deliveryStatus: "uncertain", deliveryStage: "recovery-verifying" },
+    { id: "delivered-1", captureId: "capture-2", workspace: "C:/trusted/project", sandboxMode: "read-only", status: "completed", deliveryStatus: "submitted", deliveryStage: "recovery-confirmed" },
+    { id: "abandoned-1", captureId: "capture-3", workspace: "C:/trusted/project", sandboxMode: "read-only", status: "completed", deliveryStatus: "abandoned", deliveryStage: "recovery-abandoned" },
+  ];
+  const captures = submissions.map((submission) => ({ id: submission.captureId, text: submission.id, timestamp: "2026-11-18T00:00:00.000Z", conversationUrl: "https://chatgpt.com/c/1" }));
+  const html = renderCaptures(captures, "source", "nonce", "", "info", undefined, [], submissions);
+  assert.match(html, /Delivery: Verifying/);
+  assert.match(html, /Delivery: Delivered/);
+  assert.match(html, /Delivery: Abandoned/);
+});

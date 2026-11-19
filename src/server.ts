@@ -22,12 +22,14 @@ const maxCodexSubmissionIdLength = 128;
 const maxWorkspacePathLength = 4_096;
 const submissionStateFile = path.join(bridgeProjectRoot, ".local", "codex-submissions.json");
 const automationStateFile = path.join(bridgeProjectRoot, ".local", "automation-state.json");
+const approvedWorkspacesFile = path.join(bridgeProjectRoot, ".local", "workspaces.json");
 
 export interface CapturePayload {
   id: string;
   text: string;
   timestamp: string;
   conversationUrl: string;
+  status?: "skipped";
 }
 
 export interface CodexResult {
@@ -80,6 +82,12 @@ interface CodexSubmission {
   elapsedMs?: number;
   latestProgressEvent?: unknown | null;
   timeoutReason?: "idle" | "max-runtime";
+  deliveryStatus?: "submitted" | "uncertain" | "abandoned";
+  deliveryStage?: string;
+  deliveryUpdatedAt?: string;
+  deliveryReportFingerprint?: string;
+  deliveryMessageKey?: string;
+  deliveryEvidence?: "observed" | "manual";
   captureSnapshot?: CapturePayload;
   manager?: CodexSessionLike;
 }
@@ -113,13 +121,26 @@ function readAutomationState(filePath = automationStateFile): AutomationState {
   } catch { return defaultAutomationState(); }
 }
 
-function hasTerminalStopMarker(value: string): boolean {
+function hasStandaloneAutomationMarker(value: string, marker: "AI_BRIDGE_STOP" | "AI_BRIDGE_SKIP"): boolean {
   let fenced = false;
   for (const line of value.replace(/\r\n?/g, "\n").split("\n")) {
     if (/^\s*(```|~~~)/.test(line)) { fenced = !fenced; continue; }
-    if (!fenced && /^\s*AI_BRIDGE_STOP\s*$/.test(line)) return true;
+    if (!fenced && !/^\s*>/.test(line) && new RegExp(`^\\s*${marker}\\s*$`).test(line)) return true;
   }
   return false;
+}
+
+function hasTerminalStopMarker(value: string): boolean { return hasStandaloneAutomationMarker(value, "AI_BRIDGE_STOP"); }
+function hasSkipMarker(value: string): boolean { return hasStandaloneAutomationMarker(value, "AI_BRIDGE_SKIP"); }
+
+function reportFingerprint(value: string): string {
+  const text = value.replace(/\s+/g, " ").trim();
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `${text.length}:${(hash >>> 0).toString(16)}`;
 }
 
 function writeSubmissionState(submissions: Map<string, CodexSubmission>, filePath = submissionStateFile): void {
@@ -150,7 +171,8 @@ function validateCapturePayload(payload: unknown): CapturePayload | undefined {
     typeof candidate.text !== "string" || candidate.text.length === 0 || candidate.text.length > maxCaptureTextLength ||
     typeof candidate.timestamp !== "string" || Number.isNaN(Date.parse(candidate.timestamp)) ||
     typeof candidate.conversationUrl !== "string" || candidate.conversationUrl.length === 0 ||
-    candidate.conversationUrl.length > maxConversationUrlLength
+    candidate.conversationUrl.length > maxConversationUrlLength ||
+    (candidate.status !== undefined && candidate.status !== "skipped")
   ) return undefined;
 
   const identity = conversation.normalizeConversationUrl(candidate.conversationUrl);
@@ -161,6 +183,7 @@ function validateCapturePayload(payload: unknown): CapturePayload | undefined {
     text: candidate.text,
     timestamp: candidate.timestamp,
     conversationUrl: identity.url,
+    ...(candidate.status === "skipped" ? { status: "skipped" as const } : {}),
   };
 }
 
@@ -243,9 +266,32 @@ function resolveVscodeTokenFile(filePath = process.env.AI_DEV_BRIDGE_TOKEN_FILE 
   return path.isAbsolute(filePath) ? filePath : path.resolve(bridgeProjectRoot, filePath);
 }
 
-function allowedWorkspaceRoots(): string[] {
+function canonicalWorkspacePath(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length === 0 || value.length > maxWorkspacePathLength || !path.isAbsolute(value)) return undefined;
+  const resolved = path.resolve(value);
+  let stat: fs.Stats;
+  try { stat = fs.statSync(resolved); } catch { return undefined; }
+  if (!stat.isDirectory()) return undefined;
+  try { return fs.realpathSync(resolved); } catch { return undefined; }
+}
+
+function readApprovedWorkspaces(filePath = approvedWorkspacesFile): string[] {
+  try {
+    const value = JSON.parse(fs.readFileSync(filePath, "utf8")) as { workspaces?: unknown };
+    if (!Array.isArray(value?.workspaces)) return [];
+    return [...new Set(value.workspaces.map(canonicalWorkspacePath).filter((item): item is string => Boolean(item)))];
+  } catch { return []; }
+}
+
+function writeApprovedWorkspaces(workspaces: string[], filePath = approvedWorkspacesFile): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(filePath, `${JSON.stringify({ workspaces: [...new Set(workspaces)].sort() })}\n`, { encoding: "utf8", mode: 0o600 });
+  try { fs.chmodSync(filePath, 0o600); } catch { /* Windows may ignore mode bits. */ }
+}
+
+function allowedWorkspaceRoots(filePath = approvedWorkspacesFile): string[] {
   const configured = process.env.AI_DEV_BRIDGE_ALLOWED_WORKSPACES;
-  return (configured ? configured.split(path.delimiter) : [bridgeProjectRoot])
+  return [...(configured ? configured.split(path.delimiter) : [bridgeProjectRoot]), ...readApprovedWorkspaces(filePath)]
     .map((item) => item.trim())
     .filter(Boolean)
     .map((item) => {
@@ -254,28 +300,23 @@ function allowedWorkspaceRoots(): string[] {
     .filter(Boolean);
 }
 
-function validateWorkspace(value: unknown): string | undefined {
-  if (typeof value !== "string" || value.length === 0 || value.length > maxWorkspacePathLength || !path.isAbsolute(value)) return undefined;
-  const resolved = path.resolve(value);
-  let stat: fs.Stats;
-  try { stat = fs.statSync(resolved); } catch { return undefined; }
-  if (!stat.isDirectory()) return undefined;
-  let canonical: string;
-  try { canonical = fs.realpathSync(resolved); } catch { return undefined; }
-  if (!allowedWorkspaceRoots().some((root) => {
+function validateWorkspace(value: unknown, approvedFile = approvedWorkspacesFile): string | undefined {
+  const canonical = canonicalWorkspacePath(value);
+  if (!canonical) return undefined;
+  if (!allowedWorkspaceRoots(approvedFile).some((root) => {
     const relative = path.relative(root, canonical);
     return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
   })) return undefined;
   return canonical;
 }
 
-function workspaceValidationMessage(value: unknown): string | undefined {
+function workspaceValidationMessage(value: unknown, approvedFile = approvedWorkspacesFile): string | undefined {
   if (typeof value !== "string" || value.trim().length === 0) return "Trusted workspace is required.";
   if (!path.isAbsolute(value)) return "Workspace path must be absolute.";
   let stat: fs.Stats;
   try { stat = fs.statSync(path.resolve(value)); } catch { return "Workspace path does not exist."; }
   if (!stat.isDirectory()) return "Workspace path is not a directory.";
-  if (!validateWorkspace(value)) return "Workspace is not trusted or allowlisted. Add it to AI_DEV_BRIDGE_ALLOWED_WORKSPACES and restart the bridge.";
+  if (!validateWorkspace(value, approvedFile)) return "Workspace is not trusted or allowlisted. Approve it explicitly in the paired Chrome popup or add it to AI_DEV_BRIDGE_ALLOWED_WORKSPACES.";
   return undefined;
 }
 
@@ -541,6 +582,7 @@ function createServer(
   };
 
   const startSubmission = (capture: CapturePayload, workspace: string, sandboxMode: "read-only" | "workspace-write", parentSubmissionId?: string, allowExisting = false): CodexSubmission | undefined => {
+    if (capture.status === "skipped") return undefined;
     if ((!allowExisting && captureSubmissions.has(captureSubmissionKey(capture))) || activeSubmissionId) return undefined;
     const submission: CodexSubmission = {
       id: crypto.randomBytes(16).toString("hex"), captureId: capture.id, workspace, sandboxMode, status: "queued", sourceConversationUrl: capture.conversationUrl, captureSnapshot: { ...capture },
@@ -570,7 +612,7 @@ function createServer(
     }
 
     const requestPath = request.url?.split("?")[0];
-    if (requestPath === "/api/codex/pair" || requestPath === "/api/codex/latest" || requestPath === "/api/codex/control" || requestPath === "/api/codex/approvals" || requestPath === "/api/codex/approval-decision") {
+    if (requestPath === "/api/codex/pair" || requestPath === "/api/codex/latest" || requestPath === "/api/codex/control" || requestPath === "/api/codex/approvals" || requestPath === "/api/codex/approval-decision" || requestPath === "/api/codex/delivery-status" || requestPath === "/api/codex/workspaces") {
       if (requestPath === "/api/codex/pair") {
         if (origin !== extensionOrigin) {
           sendJson(response, 403, { success: false, error: "Forbidden origin" }, origin);
@@ -610,7 +652,7 @@ function createServer(
           sendJson(response, 403, { success: false, error: "Forbidden origin" }, origin);
           return;
         }
-        const methods = request.url === "/api/codex/control" || request.url === "/api/codex/approval-decision" ? "GET, POST, OPTIONS" : "GET, OPTIONS";
+        const methods = request.url === "/api/codex/control" || request.url === "/api/codex/approval-decision" || request.url === "/api/codex/delivery-status" || request.url === "/api/codex/workspaces" ? "GET, POST, DELETE, OPTIONS" : "GET, OPTIONS";
         sendCorsOptions(response, methods, "Content-Type, Authorization");
         return;
       }
@@ -618,6 +660,30 @@ function createServer(
       if (!hasValidBearerToken(request, chromeToken)) {
         response.setHeader("WWW-Authenticate", "Bearer");
         sendJson(response, 401, { success: false, error: chromeToken ? "Invalid pairing token" : "Chrome pairing required" }, origin);
+        return;
+      }
+      if (requestPath === "/api/codex/workspaces") {
+        if (request.method === "GET") { sendJson(response, 200, { success: true, workspaces: readApprovedWorkspaces() }, origin); return; }
+        if (request.method !== "POST" && request.method !== "DELETE") { response.setHeader("Allow", "GET, POST, DELETE, OPTIONS"); sendJson(response, 405, { success: false, error: "Method not allowed" }, origin); return; }
+        try {
+          const payload = await readJson(request) as Record<string, unknown>;
+          const workspace = canonicalWorkspacePath(payload.workspace);
+          if (!workspace) { sendJson(response, 400, { success: false, error: "Workspace must be an existing absolute directory." }, origin); return; }
+          const approved = readApprovedWorkspaces();
+          if (request.method === "POST") {
+            if (payload.confirm !== true) { sendJson(response, 400, { success: false, error: "Explicit workspace approval confirmation required." }, origin); return; }
+            const next = [...new Set([...approved, workspace])];
+            writeApprovedWorkspaces(next);
+            emitEvent("workspace.approved", { workspace });
+            sendJson(response, 200, { success: true, workspace, workspaces: next.sort() }, origin);
+          } else {
+            const next = approved.filter((item) => item !== workspace);
+            if (next.length === approved.length) { sendJson(response, 404, { success: false, error: "Workspace is not persistently approved." }, origin); return; }
+            writeApprovedWorkspaces(next);
+            emitEvent("workspace.revoked", { workspace });
+            sendJson(response, 200, { success: true, workspace, workspaces: next }, origin);
+          }
+        } catch (error) { sendJson(response, 400, { success: false, error: error instanceof Error ? error.message : "Invalid workspace request" }, origin); }
         return;
       }
       if (requestPath === "/api/codex/approvals") {
@@ -642,6 +708,42 @@ function createServer(
           emitEvent("approval.resolved", { requestId: String(requestId), submissionId, status: decision === "approve" ? "approved" : "denied" });
           sendJson(response, 200, { success: true, decision: decision === "approve" ? "approved" : "denied" }, origin);
         } catch (error) { sendJson(response, 400, { success: false, error: error instanceof Error ? error.message : "Invalid approval decision" }, origin); }
+        return;
+      }
+      if (requestPath === "/api/codex/delivery-status") {
+        if (request.method !== "POST") { response.setHeader("Allow", "POST, OPTIONS"); sendJson(response, 405, { success: false, error: "Method not allowed" }, origin); return; }
+        try {
+          const payload = await readJson(request) as Record<string, unknown>;
+          const submissionId = typeof payload.submissionId === "string" ? payload.submissionId : "";
+          const conversationUrl = typeof payload.conversationUrl === "string" ? payload.conversationUrl : "";
+          const status = payload.status === "submitted" || payload.status === "uncertain" || payload.status === "abandoned" ? payload.status : undefined;
+          const stage = typeof payload.stage === "string" && payload.stage.length <= 80 ? payload.stage : undefined;
+          const fingerprint = typeof payload.reportFingerprint === "string" && payload.reportFingerprint.length <= 128 ? payload.reportFingerprint : undefined;
+          const messageKey = typeof payload.messageKey === "string" && payload.messageKey.length <= 512 ? payload.messageKey : undefined;
+          const evidence = payload.evidence === "observed" || payload.evidence === "manual" ? payload.evidence : undefined;
+          const submission = submissions.get(submissionId);
+          const currentStatus = submission?.deliveryStatus;
+          const validTransition = !currentStatus
+            ? true
+            : currentStatus === "uncertain" && (status === "uncertain" || status === "submitted" || status === "abandoned")
+              ? true
+              : false;
+          const matchingReport = Boolean(fingerprint && submission?.response && reportFingerprint(submission.response) === fingerprint);
+          const sufficientEvidence = status === "submitted" && matchingReport && ((evidence === "observed" && Boolean(messageKey)) || (evidence === "manual" && stage === "recovery-manually-confirmed"));
+          if (!submissionId || !status || !conversation.normalizeConversationUrl(conversationUrl) || !submission || submission.status !== "completed" || !submission.sourceConversationUrl || !conversation.sameConversation(submission.sourceConversationUrl, conversationUrl) || !validTransition || (status === "submitted" && !sufficientEvidence)) {
+            sendJson(response, 409, { success: false, error: "Delivery status is stale or bound to another conversation" }, origin); return;
+          }
+          submission.deliveryStatus = status;
+          if (stage) submission.deliveryStage = stage;
+          else delete submission.deliveryStage;
+          if (fingerprint) submission.deliveryReportFingerprint = fingerprint;
+          if (messageKey) submission.deliveryMessageKey = messageKey;
+          if (evidence) submission.deliveryEvidence = evidence;
+          submission.deliveryUpdatedAt = new Date().toISOString();
+          writeSubmissionState(submissions, stateFile);
+          emitEvent("delivery.changed", { submissionId, status, stage: stage || "" });
+          sendJson(response, 200, { success: true, status }, origin);
+        } catch (error) { sendJson(response, 400, { success: false, error: error instanceof Error ? error.message : "Invalid delivery status" }, origin); }
         return;
       }
       if (requestPath === "/api/codex/control") {
@@ -1155,6 +1257,7 @@ function createServer(
           return;
         }
         const terminalStop = automation.enabled && Boolean(automation.conversationUrl) && hasTerminalStopMarker(capture.text) && conversation.sameConversation(automation.conversationUrl || "", capture.conversationUrl);
+        const terminalSkip = !terminalStop && automation.enabled && Boolean(automation.conversationUrl) && hasSkipMarker(capture.text) && conversation.sameConversation(automation.conversationUrl || "", capture.conversationUrl);
         const duplicate = !store.add(capture);
         if (!duplicate) emitEvent("capture.created", { captureId: capture.id });
         console.log("Capture received", {
@@ -1170,6 +1273,8 @@ function createServer(
           persistAutomation();
           publishAutomation();
           automationDecision = "stopped_task_completed";
+        } else if (terminalSkip || capture.status === "skipped") {
+          automationDecision = "skipped_marker";
         } else if (duplicate) automationDecision = "duplicate";
         else if (automation.stopped) automationDecision = "stopped";
         else if (!automation.enabled) automationDecision = "disabled";
@@ -1248,4 +1353,4 @@ if (require.main === module) {
   server.listen(port, host, () => console.log(`Server listening at http://${host}:${port}`));
 }
 
-export = { createCaptureStore, createServer, resolveVscodeTokenFile, validateCapturePayload, validateWorkspace };
+export = { createCaptureStore, createServer, resolveVscodeTokenFile, validateCapturePayload, validateWorkspace, canonicalWorkspacePath, readApprovedWorkspaces, writeApprovedWorkspaces };

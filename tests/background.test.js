@@ -125,6 +125,25 @@ function runConcurrentDeliveryMessages(messages, initialState, fetchImpl, select
   return Promise.all(messages.map((message) => new Promise((resolve) => listener({ ...message, conversationUrl: message.conversationUrl || selectedUrl }, { id: "extension-id" }, resolve))));
 }
 
+function createDeliverySession(initialState, fetchImpl, selectedUrl = "https://chatgpt.com/c/test") {
+  let listener;
+  const storage = { ...initialState };
+  const context = {
+    URL, console, setTimeout, clearTimeout,
+    chrome: {
+      storage: { local: {
+        get: async (keys) => Object.fromEntries(keys.filter((key) => Object.prototype.hasOwnProperty.call(storage, key)).map((key) => [key, storage[key]])),
+        set: async (values) => Object.assign(storage, values),
+        remove: async (keys) => { for (const key of (Array.isArray(keys) ? keys : [keys])) delete storage[key]; },
+      } },
+      runtime: { id: "extension-id", onMessage: { addListener(callback) { listener = callback; } } },
+    },
+    fetch: fetchImpl,
+  };
+  vm.runInNewContext(fs.readFileSync("chrome-extension/background.js", "utf8"), context);
+  return { storage, invoke: (message) => new Promise((resolve) => listener({ ...message, conversationUrl: message.conversationUrl || selectedUrl }, { id: "extension-id" }, resolve)) };
+}
+
 function bridgeResponse(body, status = 200) {
   return { ok: status >= 200 && status < 300, status, json: async () => body };
 }
@@ -140,6 +159,7 @@ const completedResult = {
 
 function deliveryFetch(url) {
   if (url.includes("/api/codex/control")) return Promise.resolve(bridgeResponse({ success: true, state: { enabled: true, paused: false, conversationUrl: "https://chatgpt.com/c/test" } }));
+  if (url.includes("/api/codex/delivery-status")) return Promise.resolve(bridgeResponse({ success: true, status: "submitted" }));
   return Promise.resolve(bridgeResponse({ result: completedResult }));
 }
 
@@ -158,7 +178,7 @@ test("Codex result delivery is deduplicated and persisted after completion", asy
   assert.equal(begun.success, true);
   const duplicate = await runDeliveryMessage({ type: "getCodexResultForConversation" }, { ...state, codexDeliveryState: { status: "submitting", submissionId: "submission-1", conversationPath: "/c/test" } }, deliveryFetch);
   assert.equal(duplicate.status, "uncertain");
-  const finished = await runDeliveryMessage({ type: "finishCodexDelivery", submissionId: "submission-1", status: "submitted" }, { ...state, codexDeliveryState: { status: "submitting", submissionId: "submission-1", conversationPath: "/c/test" } }, deliveryFetch);
+  const finished = await runDeliveryMessage({ type: "finishCodexDelivery", submissionId: "submission-1", status: "submitted", messageKey: "message-1", evidence: "observed" }, { ...state, codexDeliveryState: { status: "submitting", submissionId: "submission-1", conversationPath: "/c/test", reportFingerprint: "25:8ed8ea07" } }, deliveryFetch);
   assert.equal(finished.success, true);
   const already = await runDeliveryMessage({ type: "getCodexResultForConversation" }, { ...state, codexDeliveryState: { status: "submitted", submissionId: "submission-1", conversationPath: "/c/test" } }, deliveryFetch);
   assert.equal(already.status, "submitted");
@@ -260,4 +280,59 @@ test("delivery state distinguishes a pre-send block from an attempted but unconf
   assert.equal(attempted.result.success, true);
   assert.equal(attempted.storage.codexDeliveryState.attempted, true);
   assert.equal(attempted.storage.codexDeliveryState.stage, "acknowledgment");
+});
+
+test("explicit delivery recovery confirms only the same uncertain report without resending", async () => {
+  const state = {
+    autoSubmitCodexResultsEnabled: true,
+    codexPairingToken: "paired-token",
+    selectedConversationUrl: "https://chatgpt.com/c/test",
+    codexDeliveryState: { status: "uncertain", submissionId: "submission-1", conversationPath: "/c/test", attempted: true, reportFingerprint: "25:8ed8ea07", baselineMessageKeys: ["existing-message"] },
+  };
+  const recoverFetch = (url) => {
+    if (url.includes("/api/codex/control")) return Promise.resolve(bridgeResponse({ success: true, state: { enabled: true, paused: false, conversationUrl: "https://chatgpt.com/c/test" } }));
+    if (url.includes("/api/codex/delivery-status")) return Promise.resolve(bridgeResponse({ success: true, status: "submitted" }));
+    return Promise.resolve(bridgeResponse({ result: completedResult }));
+  };
+  // Use the implementation's deterministic fingerprint rather than report text in state.
+  const session = createDeliverySession(state, recoverFetch);
+  const begun = await session.invoke({ type: "beginCodexDeliveryRecovery", submissionId: "submission-1" });
+  assert.equal(begun.success, true);
+  assert.equal(session.storage.codexDeliveryState.status, "verifying");
+  const resolved = await session.invoke({ type: "resolveCodexDeliveryRecovery", submissionId: "submission-1", reportFingerprint: begun.reportFingerprint, outcome: "confirmed", messageKey: "message-1" });
+  assert.equal(resolved.success, true);
+  assert.equal(session.storage.codexDeliveryState.status, "submitted");
+  assert.equal(session.storage.codexDeliveryState.stage, "recovery-confirmed");
+});
+
+test("legacy uncertain delivery requires explicit confirmation and never auto-confirms", async () => {
+  const state = {
+    autoSubmitCodexResultsEnabled: true,
+    codexPairingToken: "paired-token",
+    selectedConversationUrl: "https://chatgpt.com/c/test",
+    codexDeliveryState: { status: "uncertain", submissionId: "submission-1", conversationPath: "/c/test", attempted: true },
+  };
+  const session = createDeliverySession(state, deliveryFetch);
+  const begun = await session.invoke({ type: "beginCodexDeliveryRecovery", submissionId: "submission-1" });
+  assert.equal(begun.success, true);
+  assert.equal(begun.requiresManualConfirmation, true);
+  assert.equal(session.storage.codexDeliveryState.status, "verifying");
+});
+
+test("abandoning an uncertain delivery preserves the record and prevents automatic replay", async () => {
+  const state = {
+    autoSubmitCodexResultsEnabled: true,
+    codexPairingToken: "paired-token",
+    selectedConversationUrl: "https://chatgpt.com/c/test",
+    codexDeliveryState: { status: "uncertain", submissionId: "submission-1", conversationPath: "/c/test", attempted: true },
+    codexReturnInFlight: { conversationPath: "/c/test", submissionId: "submission-1" },
+  };
+  const fetchImpl = (url) => url.includes("/api/codex/delivery-status")
+    ? Promise.resolve(bridgeResponse({ success: true, status: "abandoned" })) : deliveryFetch(url);
+  const { result, storage } = await runDeliveryMessage({ type: "abandonCodexDelivery", submissionId: "submission-1" }, state, fetchImpl, undefined, true);
+  assert.equal(result.success, true);
+  assert.equal(storage.codexDeliveryState.status, "abandoned");
+  assert.equal(storage.codexReturnInFlight, undefined);
+  const availability = await runDeliveryMessage({ type: "getCodexResultForConversation" }, storage, fetchImpl);
+  assert.equal(availability.status, "abandoned");
 });

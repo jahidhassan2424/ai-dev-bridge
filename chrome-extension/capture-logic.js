@@ -83,14 +83,17 @@
     return normalizeComposerText(value).length > 0;
   }
 
-  function hasTerminalStopMarker(value) {
+  function hasStandaloneAutomationMarker(value, marker) {
     let fenced = false;
     for (const line of String(value || "").replace(/\r\n?/g, "\n").split("\n")) {
       if (/^\s*(```|~~~)/.test(line)) { fenced = !fenced; continue; }
-      if (!fenced && /^\s*AI_BRIDGE_STOP\s*$/.test(line)) return true;
+      if (!fenced && !/^\s*>/.test(line) && new RegExp(`^\\s*${marker}\\s*$`).test(line)) return true;
     }
     return false;
   }
+
+  function hasTerminalStopMarker(value) { return hasStandaloneAutomationMarker(value, "AI_BRIDGE_STOP"); }
+  function hasSkipMarker(value) { return hasStandaloneAutomationMarker(value, "AI_BRIDGE_SKIP"); }
 
   function isComposerReady(state) {
     return Boolean(
@@ -104,5 +107,5 @@
     );
   }
 
-  root.AiDevBridgeCaptureLogic = { extractAssistantText, getResponseKey, isCompletionSafe, completionDelay, normalizeComposerText, hasComposerDraft, hasTerminalStopMarker, isComposerReady, structuredNodeText, normalizeStructuredText };
+  root.AiDevBridgeCaptureLogic = { extractAssistantText, getResponseKey, isCompletionSafe, completionDelay, normalizeComposerText, hasComposerDraft, hasTerminalStopMarker, hasSkipMarker, isComposerReady, structuredNodeText, normalizeStructuredText };
 })(globalThis);

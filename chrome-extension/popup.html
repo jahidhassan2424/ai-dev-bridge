@@ -57,6 +57,11 @@
             <span class="visually-hidden">Enable automatic Codex report submission</span>
           </label>
         </div>
+        <div id="delivery-recovery-actions" class="button-row" hidden>
+          <button id="check-delivery" class="button button-secondary" type="button">Recover Delivery</button>
+          <button id="abandon-delivery" class="button button-secondary" type="button">Abandon Delivery</button>
+        </div>
+        <p id="delivery-recovery-detail" class="feedback" aria-live="polite"></p>
       </section>
 
       <section class="card capture-card" aria-labelledby="automation-heading">
@@ -68,6 +73,8 @@
         </div>
         <label class="field-label" for="automation-workspace">Trusted workspace</label>
         <input id="automation-workspace" class="text-input" type="text" placeholder="C:\\Projects\\my-app" autocomplete="off" />
+        <div class="button-row"><button id="approve-workspace" class="button button-secondary" type="button">Approve Workspace</button><button id="revoke-workspace" class="button button-secondary" type="button">Revoke</button></div>
+        <p id="workspace-approval-status" class="feedback" role="status"></p>
         <label class="field-label" for="conversation-url">Conversation URL</label>
         <div class="input-row"><input id="conversation-url" class="text-input" type="url" placeholder="https://chatgpt.com/c/..." autocomplete="off" /><button id="use-current-tab" class="button button-secondary" type="button">Use Current Tab</button></div>
         <div class="button-row">

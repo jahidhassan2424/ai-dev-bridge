@@ -5,7 +5,7 @@ const generationControlSelectors = [
 ];
 const userMessageSelector = '[data-chatgpt-search-unit-key$=":user"], [data-message-author-role="user"], [data-conversation-role="user"], [data-testid*="user-message" i]';
 const completionQuietPeriodMs = 1_800;
-const { extractAssistantText, getResponseKey, isCompletionSafe, completionDelay, normalizeComposerText, hasComposerDraft, isComposerReady } = globalThis.AiDevBridgeCaptureLogic;
+const { extractAssistantText, getResponseKey, isCompletionSafe, completionDelay, normalizeComposerText, hasComposerDraft, hasTerminalStopMarker, hasSkipMarker, isComposerReady } = globalThis.AiDevBridgeCaptureLogic;
 const { normalizeConversationUrl } = globalThis.AiDevBridgeConversation;
 
 const knownAssistantMessages = new WeakSet();
@@ -24,6 +24,7 @@ let selectedConversationUrl = "";
 let observer;
 let codexResultWatchTimer;
 let codexDeliveryInFlight = false;
+const lastDeliveryDiagnostics = new Map();
 let generationWasActive = false;
 let reconciliationQueued = false;
 let extensionContextInvalidated = false;
@@ -115,11 +116,17 @@ function setForwardingStatus(state, message) {
 }
 
 function codexDeliveryDiagnostic(stage, details = {}) {
+  if (stage === "eligibility" || stage === "availability") {
+    const key = JSON.stringify({ stage, conversationPath: details.conversationPath, status: details.status, submissionId: details.submissionId });
+    if (lastDeliveryDiagnostics.get(stage) === key) return;
+    lastDeliveryDiagnostics.set(stage, key);
+  }
   console.info("[AI Dev Bridge] Codex delivery", { stage, ...details });
 }
 
-function forwardCapturedResponse(message, text) {
-  if (!captureEnabled || !autoForwardEnabled) {
+function forwardCapturedResponse(message, text, status) {
+  const isSkipped = status === "skipped";
+  if (!captureEnabled || (!autoForwardEnabled && !isSkipped)) {
     captureDiagnostic("forwarding-skipped", { reason: !captureEnabled ? "capture-disabled" : "auto-forward-disabled" });
     return;
   }
@@ -138,13 +145,13 @@ function forwardCapturedResponse(message, text) {
   }
   try { void chrome.storage.local.get(["codexReturnInFlight"]).then(async ({ codexReturnInFlight: guard }) => {
     const currentPath = normalizeConversationUrl(location.href)?.path;
-    if (guard && guard.expiresAt > Date.now() && guard.conversationPath === currentPath) {
+    if (!isSkipped && guard && guard.expiresAt > Date.now() && guard.conversationPath === currentPath) {
       captureDiagnostic("forwarding-skipped", { reason: "codex-return-loop-guard" });
       await chrome.storage.local.remove("codexReturnInFlight");
       setForwardingStatus("ignored", "ChatGPT response was not forwarded because it followed an automatic Codex report return.");
       return;
     }
-    const capture = { id: getMessageKey(message), text, timestamp: new Date().toISOString(), conversationUrl: location.href };
+    const capture = { id: getMessageKey(message), text, timestamp: new Date().toISOString(), conversationUrl: location.href, ...(isSkipped ? { status: "skipped" } : {}) };
     captureDiagnostic("forwarding-started", { responseId: capture.id, characters: text.length });
     setForwardingStatus("pending", "Forwarding response to local bridge...");
     chrome.runtime.sendMessage({ type: "forwardCapture", capture }, (result) => {
@@ -154,9 +161,9 @@ function forwardCapturedResponse(message, text) {
       if (result.ignored) { captureDiagnostic("forwarding-skipped", { reason: "background-isolated" }); setForwardingStatus("ignored", result.reason || "Response was not forwarded because this conversation is not selected."); return; }
       captureDiagnostic("forwarding-result", { duplicate: result.duplicate === true, queued: Boolean(result.submissionId), automationDecision: result.automation?.decision || "none" });
       if (result.automation?.decision === "skipped") {
-        const messages = { disabled: "Capture forwarded, but Automation Mode is disabled.", paused: "Capture forwarded, but Automation Mode is paused.", workspace_missing: "Capture forwarded, but no automation workspace is configured.", conversation_mismatch: "Capture forwarded, but this is not the selected automation conversation.", concurrent_submission: "Capture forwarded, but another Codex submission is already running.", duplicate_submission: "Capture forwarded, but this capture already has a submission.", duplicate: "Response was already forwarded." };
+        const messages = { skipped_marker: "Captured as Skipped; no Codex submission was created.", disabled: "Capture forwarded, but Automation Mode is disabled.", paused: "Capture forwarded, but Automation Mode is paused.", workspace_missing: "Capture forwarded, but no automation workspace is configured.", conversation_mismatch: "Capture forwarded, but this is not the selected automation conversation.", concurrent_submission: "Capture forwarded, but another Codex submission is already running.", duplicate_submission: "Capture forwarded, but this capture already has a submission.", duplicate: "Response was already forwarded." };
         const reason = result.automation.reason || "unknown";
-        setForwardingStatus(reason === "conversation_mismatch" || reason === "disabled" || reason === "paused" ? "ignored" : "error", messages[reason] || `Capture forwarded; automation skipped (${reason}).`);
+        setForwardingStatus(reason === "skipped_marker" ? "success" : reason === "conversation_mismatch" || reason === "disabled" || reason === "paused" ? "ignored" : "error", messages[reason] || `Capture forwarded; automation skipped (${reason}).`);
       } else if (result.submissionId) {
         setForwardingStatus("queued", `Capture queued for Codex (${result.status || "queued"}).`);
       } else {
@@ -268,7 +275,7 @@ function findSendButton(includeDisabled = false) {
 }
 
 function findUserMessages() {
-  return Array.from(document.querySelectorAll(userMessageSelector)).filter((element) => element.isConnected);
+  return Array.from(document.querySelectorAll(userMessageSelector)).filter((element) => element.isConnected && !element.parentElement?.closest(userMessageSelector));
 }
 
 function normalizedMessageText(element) {
@@ -284,6 +291,13 @@ function userMessageBaseline() {
   return { elements: new Set(messages), keys: new Set(messages.map(userMessageKey)) };
 }
 
+function exactVisibleUserMessageMatches(text, baselineKeys = []) {
+  const expected = String(text || "").replace(/\s+/g, " ").trim();
+  if (!expected) return [];
+  const baseline = new Set(Array.isArray(baselineKeys) ? baselineKeys : []);
+  return findUserMessages().filter((element) => isVisible(element) && normalizedMessageText(element) === expected && !baseline.has(userMessageKey(element)));
+}
+
 function waitForMatchingUserMessage(text, baseline, timeoutMs = 10_000) {
   const expected = text.replace(/\s+/g, " ").trim();
   return new Promise((resolve) => {
@@ -292,7 +306,7 @@ function waitForMatchingUserMessage(text, baseline, timeoutMs = 10_000) {
     const check = () => {
       const messages = findUserMessages();
       const matched = messages.some((element) => normalizedMessageText(element) === expected && !baseline.elements.has(element) && !baseline.keys.has(userMessageKey(element)));
-      if (matched) finish(true);
+      if (matched) finish(userMessageKey(messages.find((element) => normalizedMessageText(element) === expected && !baseline.elements.has(element) && !baseline.keys.has(userMessageKey(element)))));
     };
     observer = new MutationObserver(check);
     const timer = setTimeout(() => finish(false), timeoutMs);
@@ -374,6 +388,39 @@ function sendRuntimeMessage(message) {
   });
 }
 
+async function recoverCodexDelivery(message) {
+  const current = normalizeConversationUrl(location.href);
+  const requested = normalizeConversationUrl(message?.conversationUrl);
+  if (!current || !requested || current.path !== requested.path) {
+    return { success: false, error: "Open the exact selected ChatGPT conversation before checking delivery." };
+  }
+  const begun = await sendRuntimeMessage({ type: "beginCodexDeliveryRecovery", conversationUrl: location.href, submissionId: message.submissionId });
+  if (!begun?.success) return begun || { success: false, error: "The bridge did not begin delivery recovery." };
+  const report = begun.response;
+  if (begun.requiresManualConfirmation) {
+    return { success: false, status: "uncertain", outcome: "legacy", error: "This delivery has no reliable pre-send message baseline. Explicit user confirmation is required; no automatic confirmation was attempted." };
+  }
+  if (typeof report !== "string") {
+    await sendRuntimeMessage({ type: "resolveCodexDeliveryRecovery", conversationUrl: location.href, submissionId: message.submissionId, reportFingerprint: begun.reportFingerprint, outcome: "not-found" });
+    return { success: false, error: "The original completed report is no longer available for verification." };
+  }
+  const matches = exactVisibleUserMessageMatches(report, begun.baselineMessageKeys);
+  if (matches.length === 1) {
+    const key = userMessageKey(matches[0]);
+    codexDeliveryDiagnostic("matching-message-found", { submissionId: message.submissionId, conversationPath: current.path, matchCount: 1 });
+    const resolved = await sendRuntimeMessage({ type: "resolveCodexDeliveryRecovery", conversationUrl: location.href, submissionId: message.submissionId, reportFingerprint: begun.reportFingerprint, outcome: "confirmed", messageKey: key });
+    if (resolved?.success) {
+      await chrome.storage.local.remove("codexReturnInFlight");
+      if (resolved.resumeAllowed && autoSubmitCodexResultsEnabled) startCodexResultWatch();
+    }
+    return resolved;
+  }
+  const outcome = matches.length > 1 ? "ambiguous" : "not-found";
+  codexDeliveryDiagnostic(matches.length > 1 ? "recovery-uncertain" : "matching-message-not-found", { submissionId: message.submissionId, conversationPath: current.path, matchCount: matches.length });
+  const resolved = await sendRuntimeMessage({ type: "resolveCodexDeliveryRecovery", conversationUrl: location.href, submissionId: message.submissionId, reportFingerprint: begun.reportFingerprint, outcome });
+  return { success: false, status: "uncertain", outcome, error: matches.length > 1 ? "Multiple matching user messages are visible; delivery remains uncertain." : "No exact matching user message is currently visible. Delivery remains uncertain." , resolved };
+}
+
 async function attemptCodexResultDelivery() {
   if (codexDeliveryInFlight || !autoSubmitCodexResultsEnabled || !selectedConversationUrl) return;
   const current = normalizeConversationUrl(location.href);
@@ -384,6 +431,14 @@ async function attemptCodexResultDelivery() {
   if (!available || available.status === "disabled" || available.status === "idle" || available.status === "submitted") return;
   if (available.status === "paused") { setForwardingStatus("pending", "Automatic Codex report submission is paused."); return; }
   if (available.status === "uncertain" || available.status === "error") {
+    if (available.status === "uncertain" && available.submissionId) {
+      const recovered = await recoverCodexDelivery({ conversationUrl: location.href, submissionId: available.submissionId });
+      if (recovered?.success && recovered.status === "submitted") {
+        setForwardingStatus("success", "Previously uncertain Codex delivery confirmed by read-only conversation evidence.");
+        return;
+      }
+      if (recovered?.outcome === "legacy") stopCodexResultWatch();
+    }
     setForwardingStatus("error", available.error || "Codex report delivery requires manual review.");
     return;
   }
@@ -402,7 +457,7 @@ async function attemptCodexResultDelivery() {
     setForwardingStatus("error", safetyError);
     return;
   }
-  const begun = await sendRuntimeMessage({ type: "beginCodexDelivery", conversationUrl: location.href, submissionId: result.submissionId });
+  const begun = await sendRuntimeMessage({ type: "beginCodexDelivery", conversationUrl: location.href, submissionId: result.submissionId, baselineMessageKeys: [...baselineUsers.keys] });
   if (!begun?.success) { if (begun?.status === "uncertain") setForwardingStatus("error", begun.error || "Codex report delivery is uncertain; manual review is required."); return; }
   codexDeliveryInFlight = true;
   let clicked = false;
@@ -422,10 +477,10 @@ async function attemptCodexResultDelivery() {
     codexDeliveryDiagnostic("send-attempt", { sendButtonFound: true, composerAccepted: true });
     currentSendButton.click();
     clicked = true;
-    const confirmed = await waitForMatchingUserMessage(result.response, baselineUsers);
-    codexDeliveryDiagnostic("confirmation", { confirmed, userMessageCount: findUserMessages().length, attempted: true });
-    if (!confirmed) throw new Error("ChatGPT did not confirm a new matching user message; delivery remains uncertain.");
-    const finished = await sendRuntimeMessage({ type: "finishCodexDelivery", conversationUrl: location.href, submissionId: result.submissionId, status: "submitted", attempted: true, stage: "acknowledged" });
+    const confirmedMessageKey = await waitForMatchingUserMessage(result.response, baselineUsers);
+    codexDeliveryDiagnostic("confirmation", { confirmed: Boolean(confirmedMessageKey), userMessageCount: findUserMessages().length, attempted: true });
+    if (!confirmedMessageKey) throw new Error("ChatGPT did not confirm a new matching user message; delivery remains uncertain.");
+    const finished = await sendRuntimeMessage({ type: "finishCodexDelivery", conversationUrl: location.href, submissionId: result.submissionId, status: "submitted", attempted: true, stage: "acknowledged", messageKey: confirmedMessageKey, evidence: "observed" });
     if (!finished?.success) throw new Error(finished?.error || "Bridge did not confirm Codex report delivery state.");
     await chrome.storage.local.remove("codexReturnInFlight");
     codexDeliveryDiagnostic("return-guard-cleared", { submissionId: result.submissionId, conversationPath: current.path });
@@ -519,7 +574,7 @@ async function captureIfComplete(message) {
   candidates.delete(message);
   captureDiagnostic("completion-accepted", { responseId: getMessageKey(message), characters: text.length });
 
-  if (globalThis.AiDevBridgeCaptureLogic.hasTerminalStopMarker(text)) {
+  if (hasTerminalStopMarker(text)) {
     const capture = { id: getMessageKey(message), text, timestamp: new Date().toISOString(), conversationUrl: location.href };
     captureDiagnostic("terminal-stop-detected", { responseId: capture.id });
     const stopped = await sendRuntimeMessage({ type: "stopAutomationForTerminalSignal", capture });
@@ -536,19 +591,23 @@ async function captureIfComplete(message) {
     return;
   }
 
+  const skipped = hasSkipMarker(text);
+
   try {
     await chrome.storage.local.set({
       latestCapturedResponse: {
         text,
         capturedAt: new Date().toISOString(),
+        ...(skipped ? { status: "skipped" } : {}),
       },
     });
-    captureDiagnostic("storage-result", { result: "stored", characters: text.length });
+    captureDiagnostic("storage-result", { result: skipped ? "skipped" : "stored", characters: text.length });
   } catch (error) {
     captureDiagnostic("storage-result", { result: "failed", reason: error instanceof Error ? error.name : "unknown" });
   }
 
-  forwardCapturedResponse(message, text);
+  if (skipped) captureDiagnostic("skip-detected", { responseId: getMessageKey(message) });
+  forwardCapturedResponse(message, text, skipped ? "skipped" : undefined);
 }
 
 function inspectForResponses(reason = "mutation") {
@@ -752,3 +811,17 @@ void chrome.storage.local
   .catch((error) => {
     console.debug("[AI Dev Bridge] capture initialization", { enabled: false, error });
   });
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (sender.id !== chrome.runtime.id) return false;
+  if (message?.type === "recoverCodexDelivery") {
+    void recoverCodexDelivery(message).then(sendResponse).catch((error) => sendResponse({ success: false, error: error instanceof Error ? error.message : "Delivery recovery failed." }));
+    return true;
+  }
+  if (message?.type === "resumeCodexResultWatch") {
+    if (autoSubmitCodexResultsEnabled && normalizeConversationUrl(message.conversationUrl)?.path === normalizeConversationUrl(location.href)?.path) startCodexResultWatch();
+    sendResponse({ success: true });
+    return false;
+  }
+  return false;
+});
