@@ -55,8 +55,8 @@
       !state.generationActive &&
       state.composerVisible &&
       state.composerEmpty &&
-      state.sendVisible &&
-      (!state.requireEnabledSend || !state.sendDisabled) &&
+      (!state.requireSendControl || state.sendVisible) &&
+      (!state.requireEnabledSend || (state.sendVisible && !state.sendDisabled)) &&
       !state.securityPrompt,
     );
   }

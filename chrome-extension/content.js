@@ -29,7 +29,7 @@ let reconciliationQueued = false;
 let extensionContextInvalidated = false;
 
 function captureDiagnostic(stage, details = {}) {
-  console.debug("[AI Dev Bridge] capture", { stage, ...details });
+  console.info("[AI Dev Bridge] capture", { stage, ...details });
 }
 
 function extensionContextIsAvailable() {
@@ -232,19 +232,29 @@ function composerReadiness() {
   const draft = composerDraftState(composer);
   const sendButton = findSendButton(true);
   const securityPrompt = Boolean(document.querySelector('input[type="password"], iframe[src*="captcha" i]'));
+  const checks = {
+    generationIdle: !isGenerationInProgress(),
+    composerSelected: Boolean(composer),
+    composerVisible: Boolean(composer && isVisible(composer)),
+    composerEmpty: !draft.hasDraft,
+    securityPromptAbsent: !securityPrompt,
+    sendControlPresent: Boolean(sendButton && isVisible(sendButton)),
+    sendControlEnabled: Boolean(sendButton && isVisible(sendButton) && !isSendButtonDisabled(sendButton)),
+  };
   return {
     composer,
     draft,
     sendButton,
     securityPrompt,
     ready: isComposerReady({
-      generationActive: isGenerationInProgress(),
-      composerVisible: Boolean(composer && isVisible(composer)),
-      composerEmpty: !draft.hasDraft,
-      sendVisible: Boolean(sendButton && isVisible(sendButton)),
+      generationActive: !checks.generationIdle,
+      composerVisible: checks.composerVisible,
+      composerEmpty: checks.composerEmpty,
+      sendVisible: checks.sendControlPresent,
       sendDisabled: isSendButtonDisabled(sendButton),
       securityPrompt,
     }),
+    checks,
   };
 }
 
@@ -383,7 +393,7 @@ async function attemptCodexResultDelivery() {
   let readiness = composerReadiness();
   let composer = readiness.composer;
   const baselineUsers = userMessageBaseline();
-  codexDeliveryDiagnostic("composer-detection", { composer: composerDiagnostic(composer, readiness.draft), sendButtonFound: Boolean(readiness.sendButton), sendButtonDisabled: isSendButtonDisabled(readiness.sendButton), baselineUserMessageCount: baselineUsers.elements.size });
+  codexDeliveryDiagnostic("composer-detection", { composer: composerDiagnostic(composer, readiness.draft), checks: readiness.checks, baselineUserMessageCount: baselineUsers.elements.size });
   if (!readiness.ready) {
     const safetyError = readiness.securityPrompt ? "ChatGPT is requesting login or CAPTCHA; automatic report submission stopped." : readiness.draft.hasDraft ? "ChatGPT composer contains a draft; automatic report submission stopped." : "ChatGPT composer or Send control was not recognized; manual review is required.";
     codexDeliveryDiagnostic("not-attempted", { reason: readiness.securityPrompt ? "security-prompt" : readiness.draft.hasDraft ? "composer-draft" : composer ? "composer-not-ready" : "composer-not-found", composer: composerDiagnostic(composer, readiness.draft) });
@@ -400,7 +410,7 @@ async function attemptCodexResultDelivery() {
     await chrome.storage.local.set({ codexReturnInFlight: { conversationPath: current.path, submissionId: result.submissionId, expiresAt: Date.now() + 300_000 } });
     readiness = composerReadiness();
     composer = readiness.composer;
-    codexDeliveryDiagnostic("composer-revalidation", { composer: composerDiagnostic(composer, readiness.draft), ready: readiness.ready, sendButtonFound: Boolean(readiness.sendButton), sendButtonDisabled: isSendButtonDisabled(readiness.sendButton) });
+    codexDeliveryDiagnostic("composer-revalidation", { composer: composerDiagnostic(composer, readiness.draft), checks: readiness.checks, ready: readiness.ready });
     if (!readiness.ready) {
       throw new Error(readiness.draft.hasDraft ? "ChatGPT composer contains a draft; automatic report submission stopped." : "ChatGPT composer changed before report insertion; delivery was not attempted.");
     }
@@ -417,6 +427,8 @@ async function attemptCodexResultDelivery() {
     if (!confirmed) throw new Error("ChatGPT did not confirm a new matching user message; delivery remains uncertain.");
     const finished = await sendRuntimeMessage({ type: "finishCodexDelivery", conversationUrl: location.href, submissionId: result.submissionId, status: "submitted", attempted: true, stage: "acknowledged" });
     if (!finished?.success) throw new Error(finished?.error || "Bridge did not confirm Codex report delivery state.");
+    await chrome.storage.local.remove("codexReturnInFlight");
+    codexDeliveryDiagnostic("return-guard-cleared", { submissionId: result.submissionId, conversationPath: current.path });
     setForwardingStatus("success", "Completed Codex report submitted to the selected ChatGPT conversation.");
   } catch (error) {
     if (!clicked) await chrome.storage.local.remove("codexReturnInFlight");

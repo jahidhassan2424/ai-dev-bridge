@@ -110,12 +110,14 @@ test("rearms a completed candidate after generation becomes idle without polling
   assert.equal(completionDelay({ ...candidate, lastChangedAt: 1_500 }, { generationActive: false, now: 2_000, quietPeriodMs: 1_000 }), 500);
 });
 
-test("composer readiness accepts ChatGPT's disabled empty Send control but rejects it when enabled Send is required", () => {
+test("composer readiness accepts ChatGPT's empty contenteditable before Send is rendered", () => {
   const ready = { generationActive: false, composerVisible: true, composerEmpty: true, sendVisible: true, sendDisabled: false, securityPrompt: false };
   assert.equal(isComposerReady(ready), true);
   assert.equal(isComposerReady({ ...ready, generationActive: true }), false);
   assert.equal(isComposerReady({ ...ready, composerEmpty: false }), false);
   assert.equal(isComposerReady({ ...ready, sendDisabled: true }), true);
+  assert.equal(isComposerReady({ ...ready, sendVisible: false, sendDisabled: true }), true);
+  assert.equal(isComposerReady({ ...ready, sendVisible: false, requireSendControl: true }), false);
   assert.equal(isComposerReady({ ...ready, sendDisabled: true, requireEnabledSend: true }), false);
   assert.equal(isComposerReady({ ...ready, securityPrompt: true }), false);
 });
@@ -147,7 +149,7 @@ test("Codex delivery confirms a new matching user message, not an empty composer
 
 test("Codex delivery emits metadata-only lifecycle diagnostics", () => {
   const contentScript = fs.readFileSync("chrome-extension/content.js", "utf8");
-  for (const stage of ["watch-started", "eligibility", "availability", "composer-detection", "composer-revalidation", "insertion", "send-attempt", "confirmation", "attempted-unconfirmed", "not-attempted"]) {
+  for (const stage of ["watch-started", "eligibility", "availability", "composer-detection", "composer-revalidation", "insertion", "send-attempt", "confirmation", "return-guard-cleared", "attempted-unconfirmed", "not-attempted"]) {
     assert.match(contentScript, new RegExp(`codexDeliveryDiagnostic\\(\\"${stage}\\"`));
   }
   assert.match(contentScript, /console\.info\("\[AI Dev Bridge\] Codex delivery"/);
@@ -173,10 +175,53 @@ test("Codex delivery waits for React to enable Send and records attempted state 
   assert.doesNotMatch(contentScript, /waitForComposerClear\(composer\)/);
 });
 
+test("composer diagnostics expose each readiness predicate without draft content", () => {
+  const contentScript = fs.readFileSync("chrome-extension/content.js", "utf8");
+  for (const check of ["generationIdle", "composerSelected", "composerVisible", "composerEmpty", "securityPromptAbsent", "sendControlPresent", "sendControlEnabled"]) {
+    assert.match(contentScript, new RegExp(`${check}:`));
+  }
+  assert.match(contentScript, /checks: readiness\.checks/);
+  assert.doesNotMatch(contentScript, /checks: \{[^}]*composerValue/s);
+});
+
 test("an uncertain report stays blocked without stopping discovery of newer results", () => {
   const contentScript = fs.readFileSync("chrome-extension/content.js", "utf8");
   assert.match(contentScript, /available\.status === "uncertain" \|\| available\.status === "error"/);
   assert.doesNotMatch(contentScript, /available\.status === "uncertain"\) stopCodexResultWatch/);
+});
+
+test("confirmed Codex delivery clears only its return guard before the next assistant response", () => {
+  const contentScript = fs.readFileSync("chrome-extension/content.js", "utf8");
+  const confirmation = contentScript.indexOf('status: "submitted", attempted: true, stage: "acknowledged"');
+  const guardCleared = contentScript.indexOf('remove("codexReturnInFlight")', confirmation);
+  const successStatus = contentScript.indexOf('setForwardingStatus("success"', guardCleared);
+  assert.ok(confirmation >= 0);
+  assert.ok(guardCleared > confirmation);
+  assert.ok(successStatus > guardCleared);
+  const uncertainPath = contentScript.slice(contentScript.indexOf("} catch (error) {", confirmation), contentScript.indexOf("} finally {", confirmation));
+  assert.match(uncertainPath, /if \(!clicked\) await chrome\.storage\.local\.remove\("codexReturnInFlight"\)/);
+  assert.doesNotMatch(uncertainPath, /if \(clicked\)[^{]*remove\("codexReturnInFlight"\)/);
+});
+
+test("three consecutive assistant cycles complete once across streaming and wrapper rerenders", () => {
+  const forwarded = [];
+  const seen = new Set();
+  for (let round = 1; round <= 3; round += 1) {
+    const candidate = { text: `ROUND_${round}`, lastChangedAt: 1_000, stableChecks: 1, manuallyStopped: false };
+    const streaming = { latest: true, connected: true, generationActive: true, now: 3_000, quietPeriodMs: 1_000 };
+    const completed = { ...streaming, generationActive: false };
+    assert.equal(isCompletionSafe(candidate, streaming), false);
+    assert.equal(completionDelay(candidate, { generationActive: true, now: 3_000, quietPeriodMs: 1_000 }), null);
+    assert.equal(completionDelay(candidate, { generationActive: false, now: 3_000, quietPeriodMs: 1_000 }), 0);
+    assert.equal(isCompletionSafe(candidate, completed), true);
+
+    const key = getResponseKey(`/c/test::assistant-${round}`, candidate.text);
+    if (!seen.has(key)) { seen.add(key); forwarded.push(key); }
+    const rerenderedKey = getResponseKey(`/c/test::assistant-${round}`, candidate.text);
+    if (!seen.has(rerenderedKey)) { seen.add(rerenderedKey); forwarded.push(rerenderedKey); }
+  }
+  assert.equal(forwarded.length, 3);
+  assert.equal(new Set(forwarded).size, 3);
 });
 
 test("live capture preserves candidates across wrapper rerenders and SPA navigation", () => {
@@ -205,6 +250,7 @@ test("live capture reports metadata-only lifecycle diagnostics and fails safely 
   for (const stage of ["candidate-detected", "completion-accepted", "completion-rejected", "storage-result", "forwarding-started", "forwarding-result", "context-invalidated"]) {
     assert.match(contentScript, new RegExp(`captureDiagnostic\\("${stage}"`));
   }
+  assert.match(contentScript, /console\.info\("\[AI Dev Bridge\] capture"/);
   assert.match(contentScript, /extensionContextIsAvailable/);
   assert.match(contentScript, /observer-stopped-awaiting-content-script-reinjection/);
   assert.doesNotMatch(contentScript, /captureDiagnostic\([^\n]*\{[^\n]*\btext\s*:/);
