@@ -32,5 +32,34 @@
     );
   }
 
-  root.AiDevBridgeCaptureLogic = { extractAssistantText, isCompletionSafe };
+  function completionDelay(candidate, state) {
+    if (!candidate || candidate.manuallyStopped || !candidate.text || state.generationActive) return null;
+    return Math.max(0, candidate.lastChangedAt + state.quietPeriodMs - state.now);
+  }
+
+  function getResponseKey(responseId, text) {
+    return `${responseId || "unknown"}::${text}`;
+  }
+
+  function normalizeComposerText(value) {
+    return String(value || "").replace(/[\u200B\uFEFF]/g, "").replace(/\s+/g, " ").trim();
+  }
+
+  function hasComposerDraft(value) {
+    return normalizeComposerText(value).length > 0;
+  }
+
+  function isComposerReady(state) {
+    return Boolean(
+      state &&
+      !state.generationActive &&
+      state.composerVisible &&
+      state.composerEmpty &&
+      state.sendVisible &&
+      (!state.requireEnabledSend || !state.sendDisabled) &&
+      !state.securityPrompt,
+    );
+  }
+
+  root.AiDevBridgeCaptureLogic = { extractAssistantText, getResponseKey, isCompletionSafe, completionDelay, normalizeComposerText, hasComposerDraft, isComposerReady };
 })(globalThis);

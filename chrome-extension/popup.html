@@ -31,6 +31,53 @@
         </div>
       </section>
 
+      <section class="card capture-card" aria-labelledby="forwarding-heading">
+        <div class="section-heading">
+          <div>
+            <h2 id="forwarding-heading">Auto-forward</h2>
+            <p id="forwarding-status" class="status-copy" role="status">Auto-forward is disabled.</p>
+          </div>
+          <label class="switch-control">
+            <input id="auto-forward-enabled" type="checkbox" role="switch" aria-describedby="forwarding-status" />
+            <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
+            <span class="visually-hidden">Enable auto-forwarding</span>
+          </label>
+        </div>
+      </section>
+
+      <section class="card capture-card" aria-labelledby="auto-submit-heading">
+        <div class="section-heading">
+          <div>
+            <h2 id="auto-submit-heading">Auto-submit Codex Results</h2>
+            <p id="auto-submit-status" class="status-copy" role="status">Disabled. Reports require Automation Mode and pairing.</p>
+          </div>
+          <label class="switch-control">
+            <input id="auto-submit-enabled" type="checkbox" role="switch" aria-describedby="auto-submit-status" />
+            <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
+            <span class="visually-hidden">Enable automatic Codex report submission</span>
+          </label>
+        </div>
+      </section>
+
+      <section class="card capture-card" aria-labelledby="automation-heading">
+        <div class="section-heading">
+          <div>
+            <h2 id="automation-heading">Automation Mode</h2>
+            <p id="automation-status" class="status-copy" role="status">Disabled. Enable only for the active ChatGPT conversation.</p>
+          </div>
+        </div>
+        <label class="field-label" for="automation-workspace">Trusted workspace</label>
+        <input id="automation-workspace" class="text-input" type="text" placeholder="C:\\Projects\\my-app" autocomplete="off" />
+        <label class="field-label" for="conversation-url">Conversation URL</label>
+        <div class="input-row"><input id="conversation-url" class="text-input" type="url" placeholder="https://chatgpt.com/c/..." autocomplete="off" /><button id="use-current-tab" class="button button-secondary" type="button">Use Current Tab</button></div>
+        <div class="button-row">
+          <button id="enable-automation" class="button button-primary" type="button">Enable</button>
+          <button id="pause-automation" class="button button-secondary" type="button">Pause</button>
+          <button id="resume-automation" class="button button-secondary" type="button">Resume</button>
+          <button id="stop-automation" class="button button-secondary" type="button">Stop</button>
+        </div>
+      </section>
+
       <section class="card response-card" aria-labelledby="latest-response-heading">
         <div class="section-heading response-heading">
           <div>
@@ -42,6 +89,32 @@
         <div id="captured-response" class="response-preview" tabindex="0" aria-live="polite">
           <p class="empty-state">Captured ChatGPT responses will appear here.</p>
         </div>
+      </section>
+
+      <section class="card response-card" aria-labelledby="latest-codex-heading">
+        <div class="section-heading response-heading">
+          <div>
+            <h2 id="latest-codex-heading">Latest Codex Result</h2>
+            <p id="codex-result-metadata" class="metadata">No completed Codex result yet.</p>
+          </div>
+          <span id="codex-result-status" class="response-badge">NONE</span>
+        </div>
+        <p id="codex-pairing-status" class="metadata">Chrome access is not paired.</p>
+        <div id="codex-result-response" class="response-preview" tabindex="0" aria-live="polite">
+          <p class="empty-state">Completed Codex responses will appear here.</p>
+        </div>
+        <div class="button-row">
+          <button id="pair-codex" class="button button-secondary" type="button">Pair with Bridge</button>
+          <button id="refresh-codex-result" class="button button-secondary" type="button">Refresh Result</button>
+          <button id="copy-codex-result" class="button button-primary" type="button" disabled>Copy Result</button>
+        </div>
+        <p id="codex-result-feedback" class="feedback" data-state="idle" role="status" aria-live="polite">&nbsp;</p>
+      </section>
+
+      <section class="card response-card" aria-labelledby="approvals-heading">
+        <div class="section-heading response-heading"><div><h2 id="approvals-heading">Pending approvals</h2><p id="approvals-status" class="metadata">Pair Chrome to view approval requests.</p></div></div>
+        <div id="approvals-list" class="response-preview"><p class="empty-state">No pending approvals.</p></div>
+        <button id="refresh-approvals" class="button button-secondary" type="button">Refresh approvals</button>
       </section>
 
       <section class="card bridge-card" aria-labelledby="bridge-heading">
@@ -61,6 +134,7 @@
         <p id="bridge-feedback" class="feedback" data-state="idle" role="status" aria-live="polite">&nbsp;</p>
       </section>
     </main>
+    <script src="conversation.js"></script>
     <script src="popup.js"></script>
   </body>
 </html>

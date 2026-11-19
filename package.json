@@ -4,10 +4,16 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node --test tests/*.test.js",
+    "test": "npm run build && node --test tests/*.test.js",
     "build": "tsc",
     "start": "node dist/server.js",
-    "dev": "node --watch src/server.ts"
+    "setup:windows": "powershell -ExecutionPolicy Bypass -File scripts/setup.ps1",
+    "start:windows": "powershell -ExecutionPolicy Bypass -File scripts/start-bridge.ps1",
+    "stop:windows": "powershell -ExecutionPolicy Bypass -File scripts/stop-bridge.ps1",
+    "dev": "node --watch src/server.ts",
+    "codex:poc": "npm run build && node dist/codex-app-server-poc.js",
+    "codex:readonly-poc": "npm run build && node dist/codex-app-server-poc.js",
+    "codex:session-manager": "npm run build && node --test tests/codex-session-manager.test.js"
   },
   "keywords": [],
   "author": "",
