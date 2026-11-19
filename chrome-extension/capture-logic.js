@@ -49,6 +49,15 @@
     return normalizeComposerText(value).length > 0;
   }
 
+  function hasTerminalStopMarker(value) {
+    let fenced = false;
+    for (const line of String(value || "").replace(/\r\n?/g, "\n").split("\n")) {
+      if (/^\s*(```|~~~)/.test(line)) { fenced = !fenced; continue; }
+      if (!fenced && /^\s*AI_BRIDGE_STOP\s*$/.test(line)) return true;
+    }
+    return false;
+  }
+
   function isComposerReady(state) {
     return Boolean(
       state &&
@@ -61,5 +70,5 @@
     );
   }
 
-  root.AiDevBridgeCaptureLogic = { extractAssistantText, getResponseKey, isCompletionSafe, completionDelay, normalizeComposerText, hasComposerDraft, isComposerReady };
+  root.AiDevBridgeCaptureLogic = { extractAssistantText, getResponseKey, isCompletionSafe, completionDelay, normalizeComposerText, hasComposerDraft, hasTerminalStopMarker, isComposerReady };
 })(globalThis);

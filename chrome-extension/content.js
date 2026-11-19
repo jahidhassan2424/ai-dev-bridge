@@ -519,6 +519,23 @@ async function captureIfComplete(message) {
   candidates.delete(message);
   captureDiagnostic("completion-accepted", { responseId: getMessageKey(message), characters: text.length });
 
+  if (globalThis.AiDevBridgeCaptureLogic.hasTerminalStopMarker(text)) {
+    const capture = { id: getMessageKey(message), text, timestamp: new Date().toISOString(), conversationUrl: location.href };
+    captureDiagnostic("terminal-stop-detected", { responseId: capture.id });
+    const stopped = await sendRuntimeMessage({ type: "stopAutomationForTerminalSignal", capture });
+    if (stopped?.success) {
+      autoForwardEnabled = false;
+      autoSubmitCodexResultsEnabled = false;
+      stopCodexResultWatch();
+      setForwardingStatus("success", "Stopped: task completed.");
+      captureDiagnostic("terminal-stop-accepted", { responseId: capture.id });
+    } else {
+      captureDiagnostic("terminal-stop-failed", { responseId: capture.id });
+      setForwardingStatus("error", stopped?.error || "Terminal stop could not be confirmed; automation remains paused for manual review.");
+    }
+    return;
+  }
+
   try {
     await chrome.storage.local.set({
       latestCapturedResponse: {

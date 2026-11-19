@@ -134,6 +134,16 @@ async function refreshAutoSubmitDeliveryStatus() {
 }
 
 function displayAutomationState(state) {
+  if (state?.stopped) {
+    automationStatus.textContent = state.stoppedReason === "task-completed" ? "Stopped: task completed." : "Stopped by user. Enable a new automation session to continue.";
+    automationStatus.dataset.state = "idle";
+    autoForwardEnabled.checked = false;
+    autoSubmitEnabled.checked = false;
+    void chrome.storage.local.set({ autoForwardEnabled: false, autoSubmitCodexResultsEnabled: false });
+    if (state.workspace) automationWorkspace.value = state.workspace;
+    if (state.conversationUrl) conversationUrlInput.value = state.conversationUrl;
+    return;
+  }
   if (!state?.enabled) {
     automationStatus.textContent = "Disabled. Enable only for the active ChatGPT conversation.";
     automationStatus.dataset.state = "idle";

@@ -153,6 +153,30 @@ async function markDeliveryUncertain(sendResponse, conversationUrl, submissionId
   }
 }
 
+async function stopForTerminalSignal(sendResponse, capture) {
+  try {
+    const settings = await chrome.storage.local.get(["codexPairingToken", "selectedConversationUrl"]);
+    const selected = normalizeConversationUrl(settings.selectedConversationUrl);
+    const incoming = normalizeConversationUrl(capture?.conversationUrl);
+    if (!settings.codexPairingToken || !selected || !incoming || selected.path !== incoming.path) {
+      sendResponse({ success: false, error: "Terminal signal is not from the selected paired conversation." });
+      return;
+    }
+    const response = await fetch(`${bridgeUrl}/api/codex/control`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${settings.codexPairingToken}` },
+      body: JSON.stringify({ command: "terminal-stop", capture }),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok || body.success !== true || !body.state?.stopped) throw new Error(body.error || `Bridge returned ${response.status}`);
+    await chrome.storage.local.set({ autoForwardEnabled: false, autoSubmitCodexResultsEnabled: false, automationStopped: { reason: body.state.stoppedReason || "task-completed", at: body.state.stoppedAt || new Date().toISOString() } });
+    deliveryDiagnostic("automation-stopped", { reason: body.state.stoppedReason, conversationPath: selected.path });
+    sendResponse({ success: true, state: body.state });
+  } catch (error) {
+    sendResponse({ success: false, error: error?.message || "Unable to stop automation." });
+  }
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (sender.id !== chrome.runtime.id) return false;
 
@@ -175,6 +199,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         .catch((error) => sendResponse({ success: false, error: error?.name === "AbortError" ? "Bridge request timed out." : error?.message || "Bridge unavailable." }))
         .finally(() => clearTimeout(timeout));
     }).catch(() => sendResponse({ success: false, error: "Unable to read automation selection." }));
+    return true;
+  }
+  if (message?.type === "stopAutomationForTerminalSignal") {
+    void stopForTerminalSignal(sendResponse, message.capture);
     return true;
   }
 

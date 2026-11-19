@@ -181,20 +181,23 @@ test("VS Code live events require host authentication and announce authoritative
     reader = stream.body.getReader();
     const decoder = new TextDecoder();
     let received = "";
-    const posted = await fetch(`${url}/api/captures`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Origin: origin },
-      body: JSON.stringify({ ...capture, id: "event-capture" }),
-    });
-    assert.equal(posted.status, 200);
-    for (let index = 0; index < 5 && !received.includes("capture.created"); index += 1) {
+    for (let index = 1; index <= 5; index += 1) {
+      const posted = await fetch(`${url}/api/captures`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Origin: origin },
+        body: JSON.stringify({ ...capture, id: `event-capture-${index}` }),
+      });
+      assert.equal(posted.status, 200);
+    }
+    for (let index = 0; index < 12 && !received.includes('"captureId":"event-capture-5"'); index += 1) {
       const chunk = await reader.read();
       if (chunk.done) break;
       received += decoder.decode(chunk.value, { stream: true });
     }
     assert.match(received, /"type":"connected"/);
     assert.match(received, /"type":"capture\.created"/);
-    assert.match(received, /"captureId":"event-capture"/);
+    assert.match(received, /"captureId":"event-capture-1"/);
+    assert.match(received, /"captureId":"event-capture-5"/);
     assert.doesNotMatch(received, /Untrusted captured text/);
   } finally {
     await reader?.cancel();
@@ -517,6 +520,40 @@ test("automation submits each new matching capture once in the selected workspac
   } finally {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     fs.rmSync(tokenDirectory, { recursive: true, force: true });
+  }
+});
+
+test("terminal stop is persisted and never queues the marker as a Codex turn", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-dev-bridge-terminal-stop-"));
+  const stateFile = path.join(directory, "submissions.json");
+  let prompts = 0;
+  class Manager { async connect() {} async runPrompt() { prompts += 1; return { threadId: "thread", response: "ok", status: "completed" }; } cancelCurrentTurn() {} }
+  const start = async () => {
+    const server = createServer(createCaptureStore(), "test-vscode-token", () => new Manager(), path.join(directory, "chrome.token"), false, stateFile);
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    return server;
+  };
+  let server = await start();
+  try {
+    let url = `http://127.0.0.1:${server.address().port}`;
+    const headers = { Authorization: "Bearer test-vscode-token", "Content-Type": "application/json" };
+    const conversationUrl = "https://chatgpt.com/c/terminal";
+    await fetch(`${url}/api/vscode/codex/automation`, { method: "POST", headers, body: JSON.stringify({ enabled: true, workspace: process.cwd(), conversationUrl, sandboxMode: "read-only" }) });
+    const stop = await fetch(`${url}/api/captures`, { method: "POST", headers: { "Content-Type": "application/json", Origin: origin }, body: JSON.stringify({ ...capture, id: "terminal", text: "All work is complete.\nAI_BRIDGE_STOP\n", conversationUrl }) });
+    assert.equal((await stop.json()).automation.reason, "stopped_task_completed");
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    server = await start();
+    url = `http://127.0.0.1:${server.address().port}`;
+    const state = await fetch(`${url}/api/vscode/codex/automation`, { headers: { Authorization: "Bearer test-vscode-token" } });
+    const body = await state.json();
+    assert.equal(body.automation.stopped, true);
+    assert.equal(body.automation.stoppedReason, "task-completed");
+    const later = await fetch(`${url}/api/captures`, { method: "POST", headers: { "Content-Type": "application/json", Origin: origin }, body: JSON.stringify({ ...capture, id: "after-stop", conversationUrl }) });
+    assert.equal((await later.json()).automation.reason, "stopped");
+    assert.equal(prompts, 0);
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    fs.rmSync(directory, { recursive: true, force: true });
   }
 });
 

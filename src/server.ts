@@ -21,6 +21,7 @@ const defaultChromeTokenFile = path.join(bridgeProjectRoot, ".local", "ai-dev-br
 const maxCodexSubmissionIdLength = 128;
 const maxWorkspacePathLength = 4_096;
 const submissionStateFile = path.join(bridgeProjectRoot, ".local", "codex-submissions.json");
+const automationStateFile = path.join(bridgeProjectRoot, ".local", "automation-state.json");
 
 export interface CapturePayload {
   id: string;
@@ -86,9 +87,39 @@ interface CodexSubmission {
 interface AutomationState {
   enabled: boolean;
   paused: boolean;
+  stopped: boolean;
+  stoppedReason: "task-completed" | "manual" | null;
+  stoppedAt: string | null;
   workspace: string | null;
   conversationUrl: string | null;
   sandboxMode: "read-only" | "workspace-write";
+}
+
+function defaultAutomationState(): AutomationState {
+  return { enabled: false, paused: false, stopped: false, stoppedReason: null, stoppedAt: null, workspace: null, conversationUrl: null, sandboxMode: "workspace-write" };
+}
+
+function writeAutomationState(state: AutomationState, filePath = automationStateFile): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(filePath, `${JSON.stringify(state)}\n`, { encoding: "utf8", mode: 0o600 });
+  try { fs.chmodSync(filePath, 0o600); } catch { /* Windows may ignore mode bits. */ }
+}
+
+function readAutomationState(filePath = automationStateFile): AutomationState {
+  try {
+    const value = JSON.parse(fs.readFileSync(filePath, "utf8")) as Partial<AutomationState>;
+    if (!value || typeof value !== "object" || (value.workspace !== null && typeof value.workspace !== "string") || (value.conversationUrl !== null && typeof value.conversationUrl !== "string")) return defaultAutomationState();
+    return { ...defaultAutomationState(), ...value, enabled: value.enabled === true, paused: value.paused === true, stopped: value.stopped === true, stoppedReason: value.stoppedReason === "task-completed" || value.stoppedReason === "manual" ? value.stoppedReason : null, stoppedAt: typeof value.stoppedAt === "string" ? value.stoppedAt : null, sandboxMode: value.sandboxMode === "read-only" ? "read-only" : "workspace-write" };
+  } catch { return defaultAutomationState(); }
+}
+
+function hasTerminalStopMarker(value: string): boolean {
+  let fenced = false;
+  for (const line of value.replace(/\r\n?/g, "\n").split("\n")) {
+    if (/^\s*(```|~~~)/.test(line)) { fenced = !fenced; continue; }
+    if (!fenced && /^\s*AI_BRIDGE_STOP\s*$/.test(line)) return true;
+  }
+  return false;
 }
 
 function writeSubmissionState(submissions: Map<string, CodexSubmission>, filePath = submissionStateFile): void {
@@ -326,6 +357,7 @@ function createServer(
   chromeTokenFile = process.env.AI_DEV_BRIDGE_CHROME_TOKEN_FILE || defaultChromeTokenFile,
   simulationMode = process.env.AI_DEV_BRIDGE_SIMULATED_APPROVALS === "true",
   stateFile = process.env.AI_DEV_BRIDGE_STATE_FILE || submissionStateFile,
+  automationFile = process.env.AI_DEV_BRIDGE_AUTOMATION_STATE_FILE || (stateFile === submissionStateFile ? automationStateFile : `${stateFile}.automation`),
 ): http.Server {
   let chromeToken = readChromeToken(chromeTokenFile);
   const sessions = new Map<string, CodexSessionLike>();
@@ -335,7 +367,7 @@ function createServer(
   const eventHeartbeats = new Map<http.ServerResponse, NodeJS.Timeout>();
   let nextEventId = 1;
   let activeSubmissionId: string | undefined;
-  const automation: AutomationState = { enabled: false, paused: false, workspace: null, conversationUrl: null, sandboxMode: "workspace-write" };
+  const automation: AutomationState = readAutomationState(automationFile);
   for (const submission of readSubmissionState(stateFile)) {
     submissions.set(submission.id, submission);
     captureSubmissions.set(`${submission.conversationKey || conversation.normalizeConversationUrl(submission.sourceConversationUrl || "")?.path || "invalid"}\0${submission.captureId}`, submission.id);
@@ -353,6 +385,22 @@ function createServer(
     const message = `id: ${nextEventId++}\nevent: bridge\ndata: ${JSON.stringify({ type, timestamp: new Date().toISOString(), ...metadata })}\n\n`;
     for (const client of eventClients) {
       try { client.write(message); } catch { eventClients.delete(client); }
+    }
+  };
+
+  const automationSnapshot = (): AutomationState & { activeSubmissionId: string | null } => ({ ...automation, activeSubmissionId: activeSubmissionId || null });
+  const persistAutomation = (): void => writeAutomationState(automation, automationFile);
+  const publishAutomation = (): void => emitEvent("automation.changed", { ...automationSnapshot() });
+  const stopAutomation = (reason: "task-completed" | "manual"): void => {
+    if (automation.stopped) return;
+    automation.enabled = false;
+    automation.paused = false;
+    automation.stopped = true;
+    automation.stoppedReason = reason;
+    automation.stoppedAt = new Date().toISOString();
+    const active = activeSubmissionId ? submissions.get(activeSubmissionId) : undefined;
+    if (active && automation.conversationUrl && active.sourceConversationUrl && conversation.sameConversation(automation.conversationUrl, active.sourceConversationUrl)) {
+      active.manager?.cancelCurrentTurn();
     }
   };
 
@@ -585,7 +633,7 @@ function createServer(
       }
       if (requestPath === "/api/codex/control") {
         if (request.method === "GET") {
-          sendJson(response, 200, { success: true, state: { ...automation, activeSubmissionId: activeSubmissionId || null } }, origin);
+          sendJson(response, 200, { success: true, state: automationSnapshot() }, origin);
           return;
         }
         if (request.method !== "POST") {
@@ -606,21 +654,33 @@ function createServer(
             const candidateUrl = identity.url;
             automation.enabled = true;
             automation.paused = false;
+            automation.stopped = false;
+            automation.stoppedReason = null;
+            automation.stoppedAt = null;
             automation.workspace = workspace;
             automation.conversationUrl = candidateUrl;
             automation.sandboxMode = payload.sandboxMode === "read-only" ? "read-only" : "workspace-write";
           } else if (command === "disable") automation.enabled = false;
-          else if (command === "pause") automation.paused = true;
-          else if (command === "resume") automation.paused = false;
+          else if (command === "pause") { if (!automation.stopped) automation.paused = true; }
+          else if (command === "resume") { if (automation.stopped) { sendJson(response, 409, { success: false, error: "Automation was stopped. Enable a new automation session explicitly." }, origin); return; } automation.paused = false; }
           else if (command === "stop") {
-            automation.paused = true;
-            if (activeSubmissionId) submissions.get(activeSubmissionId)?.manager?.cancelCurrentTurn();
+            stopAutomation("manual");
+          } else if (command === "terminal-stop") {
+            const terminalCapture = validateCapturePayload(payload.capture);
+            if (!terminalCapture || !hasTerminalStopMarker(terminalCapture.text) || !conversationMatches(automation.conversationUrl, terminalCapture.conversationUrl)) {
+              sendJson(response, 400, { success: false, error: "Invalid terminal automation signal" }, origin);
+              return;
+            }
+            const duplicate = !store.add(terminalCapture);
+            if (!duplicate) emitEvent("capture.created", { captureId: terminalCapture.id, terminal: true });
+            stopAutomation("task-completed");
           } else {
             sendJson(response, 400, { success: false, error: "Unknown control command" }, origin);
             return;
           }
-          emitEvent("automation.changed", { enabled: automation.enabled, paused: automation.paused });
-          sendJson(response, 200, { success: true, state: { ...automation, activeSubmissionId: activeSubmissionId || null } }, origin);
+          persistAutomation();
+          publishAutomation();
+          sendJson(response, 200, { success: true, state: automationSnapshot() }, origin);
         } catch (error) {
           sendJson(response, 400, { success: false, error: error instanceof Error ? error.message : "Invalid control request" }, origin);
         }
@@ -676,17 +736,20 @@ function createServer(
           Connection: "keep-alive",
           "X-Content-Type-Options": "nosniff",
         });
+        response.flushHeaders();
         response.write(`retry: 2000\nevent: bridge\ndata: ${JSON.stringify({ type: "connected", timestamp: new Date().toISOString() })}\n\n`);
         eventClients.add(response);
         const heartbeat = setInterval(() => {
           try { response.write(`: heartbeat ${Date.now()}\n\n`); } catch { /* close cleanup removes the client */ }
         }, 15_000);
         eventHeartbeats.set(response, heartbeat);
-        request.on("close", () => {
+        const cleanup = () => {
           clearInterval(heartbeat);
           eventHeartbeats.delete(response);
           eventClients.delete(response);
-        });
+        };
+        request.once("aborted", cleanup);
+        response.once("close", cleanup);
         return;
       }
 
@@ -830,7 +893,7 @@ function createServer(
 
       if (request.url === "/api/vscode/codex/automation") {
         if (request.method === "GET") {
-          sendJson(response, 200, { success: true, automation: { ...automation, activeSubmissionId: activeSubmissionId || null } });
+          sendJson(response, 200, { success: true, automation: automationSnapshot() });
           return;
         }
         if (request.method !== "POST") { response.setHeader("Allow", "GET, POST"); sendJson(response, 405, { success: false, error: "Method not allowed" }); return; }
@@ -850,9 +913,13 @@ function createServer(
             automation.sandboxMode = payload.sandboxMode === "read-only" ? "read-only" : "workspace-write";
             automation.enabled = true;
             automation.paused = false;
+            automation.stopped = false;
+            automation.stoppedReason = null;
+            automation.stoppedAt = null;
           } else automation.enabled = false;
-          emitEvent("automation.changed", { enabled: automation.enabled, paused: automation.paused });
-          sendJson(response, 200, { success: true, automation: { ...automation, activeSubmissionId: activeSubmissionId || null } });
+          persistAutomation();
+          publishAutomation();
+          sendJson(response, 200, { success: true, automation: automationSnapshot() });
         } catch (error) { sendJson(response, 400, { success: false, error: error instanceof Error ? error.message : "Invalid automation request" }); }
         return;
       }
@@ -862,12 +929,13 @@ function createServer(
         try {
           const payload = await readJson(request) as Record<string, unknown>;
           const command = payload.command;
-          if (command === "pause") automation.paused = true;
-          else if (command === "resume") automation.paused = false;
-          else if (command === "stop") { automation.paused = true; if (activeSubmissionId) submissions.get(activeSubmissionId)?.manager?.cancelCurrentTurn(); }
+          if (command === "pause") { if (!automation.stopped) automation.paused = true; }
+          else if (command === "resume") { if (automation.stopped) { sendJson(response, 409, { success: false, error: "Automation was stopped. Enable a new automation session explicitly." }); return; } automation.paused = false; }
+          else if (command === "stop") { stopAutomation("manual"); }
           else { sendJson(response, 400, { success: false, error: "Unknown control command" }); return; }
-          emitEvent("automation.changed", { enabled: automation.enabled, paused: automation.paused });
-          sendJson(response, 200, { success: true, state: { ...automation, activeSubmissionId: activeSubmissionId || null } });
+          persistAutomation();
+          publishAutomation();
+          sendJson(response, 200, { success: true, state: automationSnapshot() });
         } catch (error) { sendJson(response, 400, { success: false, error: error instanceof Error ? error.message : "Invalid control request" }); }
         return;
       }
@@ -1070,6 +1138,7 @@ function createServer(
           sendJson(response, 400, { success: false, error: "Invalid capture payload" }, origin);
           return;
         }
+        const terminalStop = hasTerminalStopMarker(capture.text) && conversationMatches(automation.conversationUrl, capture.conversationUrl);
         const duplicate = !store.add(capture);
         if (!duplicate) emitEvent("capture.created", { captureId: capture.id });
         console.log("Capture received", {
@@ -1080,18 +1149,24 @@ function createServer(
         });
         let automationSubmission: CodexSubmission | undefined;
         let automationDecision: string;
-        if (duplicate) automationDecision = "duplicate";
+        if (terminalStop) {
+          stopAutomation("task-completed");
+          persistAutomation();
+          publishAutomation();
+          automationDecision = "stopped_task_completed";
+        } else if (duplicate) automationDecision = "duplicate";
+        else if (automation.stopped) automationDecision = "stopped";
         else if (!automation.enabled) automationDecision = "disabled";
         else if (automation.paused) automationDecision = "paused";
         else if (!automation.workspace) automationDecision = "workspace_missing";
         else if (!conversationMatches(automation.conversationUrl, capture.conversationUrl)) automationDecision = "conversation_mismatch";
         else automationDecision = "eligible";
-        if (automationDecision === "eligible") {
+        if (automationDecision === "eligible" && !automation.stopped) {
           const workspace = automation.workspace;
           if (workspace) automationSubmission = startSubmission(capture, workspace, automation.sandboxMode);
           if (!automationSubmission) automationDecision = activeSubmissionId ? "concurrent_submission" : "duplicate_submission";
         }
-        console.log("Capture automation decision", { captureId: capture.id, decision: automationSubmission ? "queued" : "skipped", reason: automationSubmission ? "eligible" : automationDecision, automationEnabled: automation.enabled, paused: automation.paused, workspaceConfigured: Boolean(automation.workspace), conversationConfigured: Boolean(automation.conversationUrl) });
+        console.log("Capture automation decision", { captureId: capture.id, decision: automationSubmission ? "queued" : "skipped", reason: automationSubmission ? "eligible" : automationDecision, automationEnabled: automation.enabled, paused: automation.paused, stopped: automation.stopped, workspaceConfigured: Boolean(automation.workspace), conversationConfigured: Boolean(automation.conversationUrl) });
         sendJson(response, 200, automationSubmission
           ? { success: true, duplicate, submissionId: automationSubmission.id, status: automationSubmission.status, sandboxMode: automationSubmission.sandboxMode, automation: { decision: "queued", reason: "eligible" } }
           : { success: true, duplicate, automation: { decision: "skipped", reason: automationDecision } }, origin);

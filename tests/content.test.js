@@ -5,7 +5,14 @@ const vm = require("node:vm");
 
 const context = {};
 vm.runInNewContext(fs.readFileSync("chrome-extension/capture-logic.js", "utf8"), context);
-const { extractAssistantText, getResponseKey, isCompletionSafe, completionDelay, normalizeComposerText, hasComposerDraft, isComposerReady } = context.AiDevBridgeCaptureLogic;
+const { extractAssistantText, getResponseKey, isCompletionSafe, completionDelay, normalizeComposerText, hasComposerDraft, hasTerminalStopMarker, isComposerReady } = context.AiDevBridgeCaptureLogic;
+
+test("terminal stop marker is only accepted as a standalone non-quoted, non-code line", () => {
+  assert.equal(hasTerminalStopMarker("Finished\nAI_BRIDGE_STOP\n"), true);
+  assert.equal(hasTerminalStopMarker("Please write AI_BRIDGE_STOP later"), false);
+  assert.equal(hasTerminalStopMarker("> AI_BRIDGE_STOP"), false);
+  assert.equal(hasTerminalStopMarker("```text\nAI_BRIDGE_STOP\n```"), false);
+});
 
 test("extracts verified assistant markup without toolbar controls", () => {
   const markdownNode = {
