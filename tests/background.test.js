@@ -56,6 +56,28 @@ test("background ignores a capture from another conversation tab", async () => {
   assert.equal(result.ignored, true);
 });
 
+test("terminal marker invokes the authenticated Stop command and disables both automatic paths", async () => {
+  let request;
+  const capture = { id: "stop-response", text: "Complete\nAI_BRIDGE_STOP", timestamp: "2026-11-19T12:00:00.000Z", conversationUrl: "https://chatgpt.com/c/test" };
+  const { result, storage } = await runDeliveryMessage(
+    { type: "stopAutomationForTerminalSignal", capture },
+    { codexPairingToken: "paired-token", selectedConversationUrl: capture.conversationUrl, autoForwardEnabled: true, autoSubmitCodexResultsEnabled: true },
+    async (url, options) => {
+      request = { url, options, body: JSON.parse(options.body) };
+      return bridgeResponse({ success: true, state: { stopped: true, stoppedReason: "task-completed", stoppedAt: "2026-11-19T12:00:01.000Z" } });
+    },
+    capture.conversationUrl,
+    true,
+  );
+  assert.equal(result.success, true);
+  assert.equal(request.url.endsWith("/api/codex/control"), true);
+  assert.equal(request.body.command, "stop");
+  assert.equal(request.body.reason, "task-completed");
+  assert.equal(request.options.headers.Authorization, "Bearer paired-token");
+  assert.equal(storage.autoForwardEnabled, false);
+  assert.equal(storage.autoSubmitCodexResultsEnabled, false);
+});
+
 function runDeliveryMessage(message, initialState, fetchImpl, selectedUrl = "https://chatgpt.com/c/test", includeStorage = false) {
   let listener;
   const storage = { ...initialState };

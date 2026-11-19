@@ -254,6 +254,7 @@ export function activate(context: vscode.ExtensionContext): void {
     let reconcilePending = false;
 
     const renderPanel = (notice = "", noticeKind = "info") => {
+      if (disposed) return;
       panel.webview.html = renderCaptures(captures, panel.webview.cspSource, panelNonce, notice, noticeKind, codexResult, approvals, submissions, projectContext, liveStatus, automation);
     };
 
@@ -304,6 +305,7 @@ export function activate(context: vscode.ExtensionContext): void {
       token: () => readToken(extensionRoot),
       onStatus: (status, retryInMs) => {
         liveStatus = status;
+        if (disposed) return;
         panel.title = status === "connected" ? "AI Dev Bridge Captures · Live" : `AI Dev Bridge Captures · ${status}`;
         void panel.webview.postMessage({ type: "connectionStatus", status, retryInMs });
       },
@@ -629,6 +631,11 @@ export function activate(context: vscode.ExtensionContext): void {
       if (reconcileTimer) clearTimeout(reconcileTimer);
       liveEvents.stop();
       activeLiveClients.delete(liveEvents);
+    }, null, context.subscriptions);
+    panel.onDidChangeViewState((event) => {
+      if (!event.webviewPanel.visible || disposed) return;
+      // Hidden panels retain their context, but reconcile authoritative state when shown again.
+      scheduleReconcile(0);
     }, null, context.subscriptions);
     void update();
     liveEvents.start();

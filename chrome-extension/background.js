@@ -165,7 +165,7 @@ async function stopForTerminalSignal(sendResponse, capture) {
     const response = await fetch(`${bridgeUrl}/api/codex/control`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${settings.codexPairingToken}` },
-      body: JSON.stringify({ command: "terminal-stop", capture }),
+      body: JSON.stringify({ command: "stop", reason: "task-completed", capture }),
     });
     const body = await response.json().catch(() => ({}));
     if (!response.ok || body.success !== true || !body.state?.stopped) throw new Error(body.error || `Bridge returned ${response.status}`);

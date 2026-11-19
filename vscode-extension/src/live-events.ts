@@ -47,18 +47,25 @@ interface LiveEventClientOptions {
   onStatus: (status: LiveConnectionStatus, retryInMs?: number) => void;
   onConnected: () => void;
   fetchImpl?: typeof fetch;
+  staleAfterMs?: number;
+  watchdogIntervalMs?: number;
 }
 
 export class LiveEventClient {
   private running = false;
   private controller?: AbortController;
   private retryTimer?: NodeJS.Timeout;
+  private watchdog?: NodeJS.Timeout;
   private finishWait?: () => void;
   private readonly seenIds = new Set<string>();
   private readonly fetchImpl: typeof fetch;
+  private readonly staleAfterMs: number;
+  private readonly watchdogIntervalMs: number;
 
   constructor(private readonly options: LiveEventClientOptions) {
     this.fetchImpl = options.fetchImpl || fetch;
+    this.staleAfterMs = options.staleAfterMs || 45_000;
+    this.watchdogIntervalMs = options.watchdogIntervalMs || 5_000;
   }
 
   start(): void {
@@ -71,8 +78,10 @@ export class LiveEventClient {
     this.running = false;
     this.controller?.abort();
     if (this.retryTimer) clearTimeout(this.retryTimer);
+    if (this.watchdog) clearInterval(this.watchdog);
     this.finishWait?.();
     this.retryTimer = undefined;
+    this.watchdog = undefined;
     this.finishWait = undefined;
   }
 
@@ -92,6 +101,8 @@ export class LiveEventClient {
     this.options.onStatus("connecting");
     while (this.running) {
       this.controller = new AbortController();
+      let staleConnection = false;
+      let watchdog: NodeJS.Timeout | undefined;
       try {
         const response = await this.fetchImpl(this.options.url, {
           headers: { Authorization: `Bearer ${this.options.token()}`, Accept: "text/event-stream" },
@@ -109,9 +120,18 @@ export class LiveEventClient {
         const parser = new SseParser();
         const reader = response.body.getReader();
         const decoder = new TextDecoder();
+        let lastActivityAt = Date.now();
+        watchdog = setInterval(() => {
+          if (Date.now() - lastActivityAt <= this.staleAfterMs) return;
+          staleConnection = true;
+          this.controller?.abort();
+        }, this.watchdogIntervalMs);
+        this.watchdog = watchdog;
         while (this.running) {
           const result = await reader.read();
           if (result.done) throw new Error("Live event stream ended.");
+          // Server heartbeats are SSE comments, so any byte received proves this stream is alive.
+          lastActivityAt = Date.now();
           for (const event of parser.push(decoder.decode(result.value, { stream: true }))) {
             if (event.id && this.seenIds.has(event.id)) continue;
             if (event.id) {
@@ -122,10 +142,17 @@ export class LiveEventClient {
           }
         }
       } catch (error) {
-        if (!this.running || (error instanceof Error && error.name === "AbortError")) break;
+        if (watchdog) {
+          clearInterval(watchdog);
+          if (this.watchdog === watchdog) this.watchdog = undefined;
+        }
+        if (!this.running || ((error instanceof Error && error.name === "AbortError") && !staleConnection)) break;
         const delay = reconnectDelay(attempt++);
         this.options.onStatus(attempt === 1 ? "offline" : "reconnecting", delay);
         await this.wait(delay);
+      } finally {
+        if (watchdog) clearInterval(watchdog);
+        if (this.watchdog === watchdog) this.watchdog = undefined;
       }
     }
   }

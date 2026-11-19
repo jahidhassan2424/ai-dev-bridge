@@ -398,9 +398,21 @@ function createServer(
     automation.stopped = true;
     automation.stoppedReason = reason;
     automation.stoppedAt = new Date().toISOString();
-    const active = activeSubmissionId ? submissions.get(activeSubmissionId) : undefined;
-    if (active && automation.conversationUrl && active.sourceConversationUrl && conversation.sameConversation(automation.conversationUrl, active.sourceConversationUrl)) {
-      active.manager?.cancelCurrentTurn();
+    const cancelled: CodexSubmission[] = [];
+    for (const submission of submissions.values()) {
+      const sameSession = automation.workspace === submission.workspace && Boolean(
+        automation.conversationUrl && submission.sourceConversationUrl && conversation.sameConversation(automation.conversationUrl, submission.sourceConversationUrl),
+      );
+      if (sameSession && !submission.executionStarted && (submission.status === "queued" || submission.status === "starting")) {
+        submission.status = "cancelled";
+        submission.error = "Automation stopped before Codex execution began.";
+        if (activeSubmissionId === submission.id) activeSubmissionId = undefined;
+        cancelled.push(submission);
+      }
+    }
+    if (cancelled.length) {
+      writeSubmissionState(submissions, stateFile);
+      for (const submission of cancelled) emitEvent("submission.cancelled", { submissionId: submission.id, status: submission.status, reason: "automation-stopped-before-start" });
     }
   };
 
@@ -459,6 +471,7 @@ function createServer(
       manager = getSession(submission.workspace, submission.sandboxMode);
       submission.manager = manager;
       await manager.connect();
+      if (submissions.get(submission.id)?.status === "cancelled") return;
       submission.executionStarted = true;
       submission.status = "running";
       writeSubmissionState(submissions, stateFile);
@@ -664,16 +677,19 @@ function createServer(
           else if (command === "pause") { if (!automation.stopped) automation.paused = true; }
           else if (command === "resume") { if (automation.stopped) { sendJson(response, 409, { success: false, error: "Automation was stopped. Enable a new automation session explicitly." }, origin); return; } automation.paused = false; }
           else if (command === "stop") {
-            stopAutomation("manual");
-          } else if (command === "terminal-stop") {
-            const terminalCapture = validateCapturePayload(payload.capture);
-            if (!terminalCapture || !hasTerminalStopMarker(terminalCapture.text) || !conversationMatches(automation.conversationUrl, terminalCapture.conversationUrl)) {
-              sendJson(response, 400, { success: false, error: "Invalid terminal automation signal" }, origin);
-              return;
+            if (payload.reason === "task-completed") {
+              const terminalCapture = validateCapturePayload(payload.capture);
+              const sameStoppedSession = automation.stopped && automation.stoppedReason === "task-completed";
+              if (!terminalCapture || (!automation.enabled && !sameStoppedSession) || !automation.conversationUrl || !hasTerminalStopMarker(terminalCapture.text) || !conversation.sameConversation(automation.conversationUrl, terminalCapture.conversationUrl)) {
+                sendJson(response, 400, { success: false, error: "Invalid terminal automation signal" }, origin);
+                return;
+              }
+              const duplicate = !store.add(terminalCapture);
+              if (!duplicate) emitEvent("capture.created", { captureId: terminalCapture.id, terminal: true });
+              stopAutomation("task-completed");
+            } else {
+              stopAutomation("manual");
             }
-            const duplicate = !store.add(terminalCapture);
-            if (!duplicate) emitEvent("capture.created", { captureId: terminalCapture.id, terminal: true });
-            stopAutomation("task-completed");
           } else {
             sendJson(response, 400, { success: false, error: "Unknown control command" }, origin);
             return;
@@ -1138,7 +1154,7 @@ function createServer(
           sendJson(response, 400, { success: false, error: "Invalid capture payload" }, origin);
           return;
         }
-        const terminalStop = hasTerminalStopMarker(capture.text) && conversationMatches(automation.conversationUrl, capture.conversationUrl);
+        const terminalStop = automation.enabled && Boolean(automation.conversationUrl) && hasTerminalStopMarker(capture.text) && conversation.sameConversation(automation.conversationUrl || "", capture.conversationUrl);
         const duplicate = !store.add(capture);
         if (!duplicate) emitEvent("capture.created", { captureId: capture.id });
         console.log("Capture received", {

@@ -7,11 +7,45 @@ const context = {};
 vm.runInNewContext(fs.readFileSync("chrome-extension/capture-logic.js", "utf8"), context);
 const { extractAssistantText, getResponseKey, isCompletionSafe, completionDelay, normalizeComposerText, hasComposerDraft, hasTerminalStopMarker, isComposerReady } = context.AiDevBridgeCaptureLogic;
 
+function textNode(value) { return { nodeType: 3, nodeValue: value, textContent: value }; }
+function element(tagName, children = []) {
+  return {
+    nodeType: 1,
+    tagName,
+    childNodes: children,
+    textContent: children.map((child) => child.textContent || child.nodeValue || "").join(""),
+    cloneNode() { return this; },
+    querySelectorAll() { return []; },
+  };
+}
+
 test("terminal stop marker is only accepted as a standalone non-quoted, non-code line", () => {
   assert.equal(hasTerminalStopMarker("Finished\nAI_BRIDGE_STOP\n"), true);
   assert.equal(hasTerminalStopMarker("Please write AI_BRIDGE_STOP later"), false);
   assert.equal(hasTerminalStopMarker("> AI_BRIDGE_STOP"), false);
   assert.equal(hasTerminalStopMarker("```text\nAI_BRIDGE_STOP\n```"), false);
+});
+
+test("DOM extraction preserves a formatted standalone terminal marker", () => {
+  const markdown = element("DIV", [
+    element("P", [textNode("Status: "), element("STRONG", [textNode("SUCCESS")])]),
+    element("P", [element("STRONG", [textNode("  AI_BRIDGE_STOP  ")])]),
+  ]);
+  const wrapper = { querySelectorAll: () => [markdown] };
+  const extracted = extractAssistantText(wrapper);
+  assert.equal(extracted, "Status: SUCCESS\n\nAI_BRIDGE_STOP");
+  assert.equal(hasTerminalStopMarker(extracted), true);
+});
+
+test("DOM extraction protects quoted and code-block marker examples", () => {
+  const markdown = element("DIV", [
+    element("BLOCKQUOTE", [element("P", [textNode("AI_BRIDGE_STOP")])]),
+    element("PRE", [textNode("AI_BRIDGE_STOP")]),
+  ]);
+  const extracted = extractAssistantText({ querySelectorAll: () => [markdown] });
+  assert.equal(hasTerminalStopMarker(extracted), false);
+  assert.match(extracted, /> AI_BRIDGE_STOP/);
+  assert.match(extracted, /```\nAI_BRIDGE_STOP\n```/);
 });
 
 test("extracts verified assistant markup without toolbar controls", () => {

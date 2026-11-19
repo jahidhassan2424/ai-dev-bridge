@@ -84,7 +84,8 @@ test("validates capture shape and bounds the in-memory store", () => {
 });
 
 test("capture endpoints require the extension origin and acknowledge duplicates", async () => {
-  const server = createServer(undefined, "test-vscode-token");
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-dev-bridge-capture-endpoints-"));
+  const server = createServer(undefined, "test-vscode-token", undefined, path.join(directory, "chrome.token"), false, path.join(directory, "submissions.json"));
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   const url = `http://127.0.0.1:${address.port}`;
@@ -162,6 +163,7 @@ test("capture endpoints require the extension origin and acknowledge duplicates"
     assert.equal(forbiddenStatus.status, 403);
   } finally {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    fs.rmSync(directory, { recursive: true, force: true });
   }
 });
 
@@ -526,10 +528,13 @@ test("automation submits each new matching capture once in the selected workspac
 test("terminal stop is persisted and never queues the marker as a Codex turn", async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-dev-bridge-terminal-stop-"));
   const stateFile = path.join(directory, "submissions.json");
+  const chromeTokenFile = path.join(directory, "chrome.token");
+  const chromeToken = "a".repeat(64);
+  fs.writeFileSync(chromeTokenFile, `${chromeToken}\n`);
   let prompts = 0;
   class Manager { async connect() {} async runPrompt() { prompts += 1; return { threadId: "thread", response: "ok", status: "completed" }; } cancelCurrentTurn() {} }
   const start = async () => {
-    const server = createServer(createCaptureStore(), "test-vscode-token", () => new Manager(), path.join(directory, "chrome.token"), false, stateFile);
+    const server = createServer(createCaptureStore(), "test-vscode-token", () => new Manager(), chromeTokenFile, false, stateFile);
     await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
     return server;
   };
@@ -537,10 +542,16 @@ test("terminal stop is persisted and never queues the marker as a Codex turn", a
   try {
     let url = `http://127.0.0.1:${server.address().port}`;
     const headers = { Authorization: "Bearer test-vscode-token", "Content-Type": "application/json" };
+    const chromeHeaders = { Authorization: `Bearer ${chromeToken}`, "Content-Type": "application/json", Origin: origin };
     const conversationUrl = "https://chatgpt.com/c/terminal";
     await fetch(`${url}/api/vscode/codex/automation`, { method: "POST", headers, body: JSON.stringify({ enabled: true, workspace: process.cwd(), conversationUrl, sandboxMode: "read-only" }) });
-    const stop = await fetch(`${url}/api/captures`, { method: "POST", headers: { "Content-Type": "application/json", Origin: origin }, body: JSON.stringify({ ...capture, id: "terminal", text: "All work is complete.\nAI_BRIDGE_STOP\n", conversationUrl }) });
-    assert.equal((await stop.json()).automation.reason, "stopped_task_completed");
+    const terminalCapture = { ...capture, id: "terminal", text: "All work is complete.\n  AI_BRIDGE_STOP  \n", conversationUrl };
+    const stop = await fetch(`${url}/api/codex/control`, { method: "POST", headers: chromeHeaders, body: JSON.stringify({ command: "stop", reason: "task-completed", capture: terminalCapture }) });
+    const stopBody = await stop.json();
+    assert.equal(stopBody.state.stopped, true);
+    assert.equal(stopBody.state.stoppedReason, "task-completed");
+    const duplicateStop = await fetch(`${url}/api/codex/control`, { method: "POST", headers: chromeHeaders, body: JSON.stringify({ command: "stop", reason: "task-completed", capture: terminalCapture }) });
+    assert.equal((await duplicateStop.json()).state.stoppedReason, "task-completed");
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     server = await start();
     url = `http://127.0.0.1:${server.address().port}`;
@@ -552,6 +563,145 @@ test("terminal stop is persisted and never queues the marker as a Codex turn", a
     assert.equal((await later.json()).automation.reason, "stopped");
     assert.equal(prompts, 0);
   } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("manual and automatic Stop share the authoritative transition", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-dev-bridge-shared-stop-"));
+  const chromeTokenFile = path.join(directory, "chrome.token");
+  const chromeToken = "b".repeat(64);
+  fs.writeFileSync(chromeTokenFile, `${chromeToken}\n`);
+  const server = createServer(createCaptureStore(), "test-vscode-token", undefined, chromeTokenFile, false, path.join(directory, "submissions.json"));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${server.address().port}`;
+  const vscodeHeaders = { Authorization: "Bearer test-vscode-token", "Content-Type": "application/json" };
+  const chromeHeaders = { Authorization: `Bearer ${chromeToken}`, "Content-Type": "application/json", Origin: origin };
+  const conversationUrl = "https://chatgpt.com/c/shared-stop";
+  const enable = () => fetch(`${url}/api/vscode/codex/automation`, { method: "POST", headers: vscodeHeaders, body: JSON.stringify({ enabled: true, workspace: process.cwd(), conversationUrl, sandboxMode: "read-only" }) });
+  try {
+    await enable();
+    const automatic = await fetch(`${url}/api/codex/control`, { method: "POST", headers: chromeHeaders, body: JSON.stringify({ command: "stop", reason: "task-completed", capture: { ...capture, id: "automatic-stop", text: "AI_BRIDGE_STOP", conversationUrl } }) });
+    const automaticState = (await automatic.json()).state;
+    assert.equal(automaticState.enabled, false);
+    assert.equal(automaticState.stopped, true);
+    await enable();
+    const manual = await fetch(`${url}/api/vscode/codex/control`, { method: "POST", headers: vscodeHeaders, body: JSON.stringify({ command: "stop" }) });
+    const manualState = (await manual.json()).state;
+    assert.equal(manualState.enabled, automaticState.enabled);
+    assert.equal(manualState.stopped, automaticState.stopped);
+    assert.equal(manualState.stoppedReason, "manual");
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("three completed exchanges followed by Stop produce no later Codex submission", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-dev-bridge-three-round-stop-"));
+  const chromeTokenFile = path.join(directory, "chrome.token");
+  const chromeToken = "c".repeat(64);
+  fs.writeFileSync(chromeTokenFile, `${chromeToken}\n`);
+  let prompts = 0;
+  class Manager { async connect() {} async runPrompt() { prompts += 1; return { threadId: "three-round-thread", response: `round-${prompts}`, status: "completed" }; } cancelCurrentTurn() {} }
+  const server = createServer(createCaptureStore(), "test-vscode-token", () => new Manager(), chromeTokenFile, false, path.join(directory, "submissions.json"));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${server.address().port}`;
+  const vscodeHeaders = { Authorization: "Bearer test-vscode-token", "Content-Type": "application/json" };
+  const chromeHeaders = { Authorization: `Bearer ${chromeToken}`, "Content-Type": "application/json", Origin: origin };
+  const conversationUrl = "https://chatgpt.com/c/three-round-stop";
+  try {
+    await fetch(`${url}/api/vscode/codex/automation`, { method: "POST", headers: vscodeHeaders, body: JSON.stringify({ enabled: true, workspace: process.cwd(), conversationUrl, sandboxMode: "read-only" }) });
+    for (let round = 1; round <= 3; round += 1) {
+      const queued = await fetch(`${url}/api/captures`, { method: "POST", headers: { "Content-Type": "application/json", Origin: origin }, body: JSON.stringify({ ...capture, id: `round-${round}`, text: `ROUND_${round}`, conversationUrl }) });
+      assert.equal(typeof (await queued.json()).submissionId, "string");
+      for (let attempt = 0; attempt < 20 && prompts < round; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    const stopped = await fetch(`${url}/api/codex/control`, { method: "POST", headers: chromeHeaders, body: JSON.stringify({ command: "stop", reason: "task-completed", capture: { ...capture, id: "round-stop", text: "Final result\nAI_BRIDGE_STOP", conversationUrl } }) });
+    assert.equal((await stopped.json()).state.stoppedReason, "task-completed");
+    const acknowledgment = await fetch(`${url}/api/captures`, { method: "POST", headers: { "Content-Type": "application/json", Origin: origin }, body: JSON.stringify({ ...capture, id: "post-stop-ack", text: "Understood.", conversationUrl }) });
+    assert.equal((await acknowledgment.json()).automation.reason, "stopped");
+    assert.equal(prompts, 3);
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("automatic Stop cancels only a matching submission that has not begun execution", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-dev-bridge-stop-race-"));
+  const chromeTokenFile = path.join(directory, "chrome.token");
+  const chromeToken = "d".repeat(64);
+  fs.writeFileSync(chromeTokenFile, `${chromeToken}\n`);
+  let releaseConnect;
+  let promptCalls = 0;
+  class Manager {
+    async connect() { await new Promise((resolve) => { releaseConnect = resolve; }); }
+    async runPrompt() { promptCalls += 1; return { threadId: "race-thread", response: "unexpected", status: "completed" }; }
+    cancelCurrentTurn() { throw new Error("Stop must not terminate a running turn"); }
+  }
+  const server = createServer(createCaptureStore(), "test-vscode-token", () => new Manager(), chromeTokenFile, false, path.join(directory, "submissions.json"));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${server.address().port}`;
+  const vscodeHeaders = { Authorization: "Bearer test-vscode-token", "Content-Type": "application/json" };
+  const chromeHeaders = { Authorization: `Bearer ${chromeToken}`, "Content-Type": "application/json", Origin: origin };
+  const conversationUrl = "https://chatgpt.com/c/stop-race";
+  try {
+    await fetch(`${url}/api/vscode/codex/automation`, { method: "POST", headers: vscodeHeaders, body: JSON.stringify({ enabled: true, workspace: process.cwd(), conversationUrl, sandboxMode: "read-only" }) });
+    const queued = await fetch(`${url}/api/captures`, { method: "POST", headers: { "Content-Type": "application/json", Origin: origin }, body: JSON.stringify({ ...capture, id: "race-pending", text: "pending instruction", conversationUrl }) });
+    const submissionId = (await queued.json()).submissionId;
+    const stop = await fetch(`${url}/api/codex/control`, { method: "POST", headers: chromeHeaders, body: JSON.stringify({ command: "stop", reason: "task-completed", capture: { ...capture, id: "race-stop", text: "AI_BRIDGE_STOP", conversationUrl } }) });
+    assert.equal((await stop.json()).state.stopped, true);
+    releaseConnect();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const status = await fetch(`${url}/api/vscode/codex/status/${submissionId}`, { headers: { Authorization: "Bearer test-vscode-token" } });
+    assert.equal((await status.json()).status, "cancelled");
+    assert.equal(promptCalls, 0);
+  } finally {
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("automatic Stop leaves an unrelated running workspace submission untouched", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-dev-bridge-unrelated-stop-"));
+  const chromeTokenFile = path.join(directory, "chrome.token");
+  const chromeToken = "e".repeat(64);
+  fs.writeFileSync(chromeTokenFile, `${chromeToken}\n`);
+  const store = createCaptureStore();
+  const unrelatedCapture = { ...capture, id: "unrelated-running", text: "unrelated manual task", conversationUrl: "https://chatgpt.com/c/unrelated" };
+  store.add(unrelatedCapture);
+  let releaseTurn;
+  let cancelCalls = 0;
+  class Manager {
+    async connect() {}
+    async runPrompt() { await new Promise((resolve) => { releaseTurn = resolve; }); return { threadId: "unrelated-thread", response: "completed", status: "completed" }; }
+    cancelCurrentTurn() { cancelCalls += 1; }
+    getStatus() { return { turn: "running" }; }
+  }
+  const server = createServer(store, "test-vscode-token", () => new Manager(), chromeTokenFile, false, path.join(directory, "submissions.json"));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${server.address().port}`;
+  const vscodeHeaders = { Authorization: "Bearer test-vscode-token", "Content-Type": "application/json" };
+  const chromeHeaders = { Authorization: `Bearer ${chromeToken}`, "Content-Type": "application/json", Origin: origin };
+  const selectedConversation = "https://chatgpt.com/c/selected-stop";
+  try {
+    await fetch(`${url}/api/vscode/codex/automation`, { method: "POST", headers: vscodeHeaders, body: JSON.stringify({ enabled: true, workspace: process.cwd(), conversationUrl: selectedConversation, sandboxMode: "read-only" }) });
+    const submitted = await fetch(`${url}/api/vscode/codex/submit`, { method: "POST", headers: vscodeHeaders, body: JSON.stringify({ captureId: unrelatedCapture.id, workspace: path.join(process.cwd(), "vscode-extension"), sandboxMode: "read-only" }) });
+    const submissionId = (await submitted.json()).submissionId;
+    for (let attempt = 0; attempt < 20 && !releaseTurn; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    const stopped = await fetch(`${url}/api/codex/control`, { method: "POST", headers: chromeHeaders, body: JSON.stringify({ command: "stop", reason: "task-completed", capture: { ...capture, id: "selected-stop", text: "AI_BRIDGE_STOP", conversationUrl: selectedConversation } }) });
+    assert.equal((await stopped.json()).state.stopped, true);
+    assert.equal(cancelCalls, 0);
+    const running = await fetch(`${url}/api/vscode/codex/status/${submissionId}`, { headers: { Authorization: "Bearer test-vscode-token" } });
+    assert.equal((await running.json()).status, "running");
+    releaseTurn();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const completed = await fetch(`${url}/api/vscode/codex/status/${submissionId}`, { headers: { Authorization: "Bearer test-vscode-token" } });
+    assert.equal((await completed.json()).status, "completed");
+  } finally {
+    if (releaseTurn) releaseTurn();
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     fs.rmSync(directory, { recursive: true, force: true });
   }
